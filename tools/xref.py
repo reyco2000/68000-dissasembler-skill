@@ -25,11 +25,12 @@ from collections import defaultdict
 try:
     from tools.dasm68k import build_disassembler, add_common_args
     from tools.m68k import ea_address
-    from tools import macsyms
+    from tools import macsyms, atarisyms
 except ImportError:
     from dasm68k import build_disassembler, add_common_args
     from m68k import ea_address
     import macsyms
+    import atarisyms
 
 WRITERS = ("MOVE", "MOVEA", "CLR", "ADDQ", "SUBQ", "ADD", "SUB", "ADDI", "SUBI", "AND", "ANDI",
            "OR", "ORI", "EOR", "EORI", "NOT", "NEG", "NEGX", "BSET", "BCLR", "BCHG", "TAS", "ST",
@@ -54,7 +55,8 @@ class CrossReferenceBuilder:
         self.jumps_from = defaultdict(list)
         self.jumps_to = defaultdict(list)
         self.data_refs = defaultdict(list)
-        self.trap_calls = defaultdict(list)      # trap word -> [pc]
+        self.trap_calls = defaultdict(list)      # line-A word -> [pc]
+        self.sys_calls = defaultdict(list)       # "GEMDOS Fopen" -> [pc] (Atari TRAP calls)
         self.lowmem = defaultdict(list)          # addr -> [(pc, 'r'|'w')]
         self.hw_accesses = defaultdict(list)     # addr -> [(pc, 'r'|'w')]
         self.ext_calls = defaultdict(list)       # outside-image call targets
@@ -74,6 +76,9 @@ class CrossReferenceBuilder:
             if ins.trap:
                 self.trap_calls[ins.words[0]].append(pc)
                 continue
+            if pc in d.tos_calls:
+                sysname, name, _fn = d.tos_calls[pc]
+                self.sys_calls[f"{sysname} {name}" if sysname not in ("AES", "VDI") else sysname].append(pc)
             t = ins.target if ins.flow == "call" else (d.a5_calls.get(pc) or
                                                         (d.reg_calls.get(pc) if ins.flow == "call_ind" else None))
             if t is not None:
@@ -103,14 +108,13 @@ class CrossReferenceBuilder:
                     self.data_refs[a].append(pc)
                     if write and a in d.owner and not d.rom_name:
                         self.stores_to_code[a].append(pc)
-                elif a in macsyms.HARDWARE or (d.mac and macsyms.hw_region(a)):
-                    if d.mac:
-                        self.hw_accesses[a].append((pc, rw))
-                elif a < 0x2000 and (d.mac or d.vector_table):
+                elif a >= 0x400000 and (a in d.plat.hardware or d.plat.device(a)):
+                    self.hw_accesses[a].append((pc, rw))
+                elif a < d.plat.lowmem_limit and (d.plat.name != "generic" or d.vector_table):
                     self.lowmem[a].append((pc, rw))
             if m == "MOVE" and len(ins.ops) == 2 and ins.ops[0][0] == "imm" and ins.ops[0][2] == 4:
-                v = ins.ops[0][1]
-                if d.mac and v in macsyms.HARDWARE or (d.mac and v == macsyms.VIA_BASE):
+                v = ins.ops[0][1] & 0xFFFFFF
+                if v >= 0x400000 and (v in d.plat.hardware or (d.mac and v == macsyms.VIA_BASE)):
                     self.hw_accesses[v].append((pc, "imm"))
         for a, refs in d.data_refs.items():
             for r in refs:
@@ -173,7 +177,7 @@ class CrossReferenceBuilder:
 
     def format_report(self) -> str:
         d = self.dasm
-        out = ["=" * 64, "CROSS-REFERENCE REPORT (68000)", "=" * 64]
+        out = ["=" * 64, f"CROSS-REFERENCE REPORT (68000, {d.plat.title})", "=" * 64]
         if d.rom_name:
             out.append(f"ROM: {d.rom_name}")
         for s, e in self.mem.get_contiguous_ranges():
@@ -197,10 +201,20 @@ class CrossReferenceBuilder:
                        + (" ..." if len(callers) > 8 else ""))
         out.append("")
 
+        if self.sys_calls:
+            out.append(f"--- System calls ({len(self.sys_calls)}) ---")
+            for name in sorted(self.sys_calls, key=lambda n: -len(self.sys_calls[n])):
+                refs = self.sys_calls[name]
+                out.append(f"  {name:28s} x{len(refs):<4d} "
+                           f"{atarisyms.CALL_DESC.get(name.split(' ')[-1], '') if ' ' in name else ''}")
+                out.append("      from: " + ", ".join(f"${r:06X}" for r in sorted(refs)[:10])
+                           + (" ..." if len(refs) > 10 else ""))
+            out.append("")
+
         if self.trap_calls:
-            out.append(f"--- A-line traps called ({len(self.trap_calls)}) ---")
+            out.append(f"--- Line-A words / traps called ({len(self.trap_calls)}) ---")
             for w in sorted(self.trap_calls, key=lambda w: -len(self.trap_calls[w])):
-                t = macsyms.trap_info(w)
+                t = d.plat.linea(w)
                 refs = self.trap_calls[w]
                 out.append(f"  ${w:04X} {t['display']:28s} x{len(refs):<4d} {t['manager']}")
                 out.append("      from: " + ", ".join(f"${r:06X}" for r in sorted(refs)[:10])
@@ -229,7 +243,7 @@ class CrossReferenceBuilder:
             out.append(f"--- Hardware registers ({len(self.hw_accesses)}) ---")
             for a in sorted(self.hw_accesses):
                 refs = self.hw_accesses[a]
-                desc = macsyms.HARDWARE.get(a, (None, (macsyms.hw_region(a) or ("", ""))[1]))[1]
+                desc = d.plat.hw_desc(a) or ""
                 out.append(f"  {self.name(a):16s} ${a:06X}  x{len(refs):<3d} {desc[:44]}  from: "
                            + ", ".join(f"${r:06X}" for r, _k in sorted(refs)[:6]))
             out.append("")
@@ -237,7 +251,7 @@ class CrossReferenceBuilder:
         if d.vector_installs:
             out.append("--- Vector / hook installs ---")
             for pc, vec, h in d.vector_installs:
-                vn = macsyms.EXCEPTION_VECTORS.get(vec, macsyms.LOWMEM.get(vec, (f"${vec:04X}",)))[0]
+                vn = d.plat.lowmem_name(vec) or f"${vec:04X}"
                 out.append(f"  ${pc:06X}: {vn} (${vec:04X}) <- {self.sub_name(h)} ${h:06X}")
             out.append("")
 
@@ -281,12 +295,34 @@ class CrossReferenceBuilder:
         return seen
 
     def traps_in(self, sub: int, ext: dict = None) -> list:
+        """Line-A words used by a subroutine."""
         cache = self.__dict__.setdefault("_traps_cache", {})
         if sub not in cache:
             out = []
             for ins in self.body_of(sub, ext):
                 if ins.trap and ins.words[0] not in out:
                     out.append(ins.words[0])
+            cache[sub] = out
+        return cache[sub]
+
+    def call_name(self, w: int) -> str:
+        return self.dasm.plat.linea(w)["display"].split(" ,")[0].replace(" ", "_")
+
+    def calls_in(self, sub: int, ext: dict = None) -> list:
+        """Names of the traps and system calls a subroutine makes."""
+        cache = self.__dict__.setdefault("_calls_cache", {})
+        if sub not in cache:
+            out = []
+            for ins in self.body_of(sub, ext):
+                if ins.trap:
+                    n = self.call_name(ins.words[0])
+                elif ins.pc in self.dasm.tos_calls:
+                    sysname, name, _fn = self.dasm.tos_calls[ins.pc]
+                    n = name if sysname not in ("AES", "VDI") else sysname
+                else:
+                    continue
+                if n not in out:
+                    out.append(n)
             cache[sub] = out
         return cache[sub]
 
@@ -323,23 +359,23 @@ class CrossReferenceBuilder:
                     tag = " [external]"
                 elif t in stack:
                     tag = " [recursive]"
-                traps = self.traps_in(t, ext) if show_traps and self.mem.is_populated(t) else []
+                traps = self.calls_in(t, ext) if show_traps and self.mem.is_populated(t) else []
                 if traps:
-                    tag += "  traps: " + " ".join(macsyms.trap_info(w)["display"].split(" ")[0] for w in traps[:6])
+                    tag += "  calls: " + " ".join(traps[:6])
                 out.append(f"{prefix}{branch}{self.sub_name(t)} (${t:06X}){tag}")
                 if self.mem.is_populated(t) and t not in stack and depth < max_depth:
                     walk(t, prefix + ("    " if last else "│   "), depth + 1, stack | {t})
 
         for r in roots:
-            traps = self.traps_in(r, ext) if show_traps else []
+            traps = self.calls_in(r, ext) if show_traps else []
             out.append(f"{self.sub_name(r)} (${r:06X})"
-                       + ("  traps: " + " ".join(macsyms.trap_info(w)["display"].split(" ")[0]
-                                                  for w in traps[:6]) if traps else ""))
+                       + ("  calls: " + " ".join(traps[:6]) if traps else ""))
             walk(r, "", 1, {r})
             out.append("")
         leaves = [s for s in self.local_subs() if not cache[s]]
         out.append(f"Subroutines: {len(self.local_subs())}, leaf: {len(leaves)}, "
-                   f"traps used: {len(self.trap_calls)}, external targets: {len(self.ext_calls)}")
+                   f"traps used: {len(self.trap_calls)}, system calls: {len(self.sys_calls)}, "
+                   f"external targets: {len(self.ext_calls)}")
         return "\n".join(out)
 
     # ---------------- sections ----------------
@@ -414,8 +450,9 @@ class CrossReferenceBuilder:
             c["id"] = i
             c["start_addr_hex"] = f"0x{lo:06X}"
             c["end_addr_hex"] = f"0x{hi:06X}"
-            c["traps"] = sorted({macsyms.trap_info(w)["display"].split(" ")[0]
-                                 for w, refs in self.trap_calls.items() if any(lo <= r <= hi for r in refs)})
+            c["traps"] = sorted({self.call_name(w) for w, refs in self.trap_calls.items()
+                                 if any(lo <= r <= hi for r in refs)} |
+                                {n for n, refs in self.sys_calls.items() if any(lo <= r <= hi for r in refs)})
             c["lowmem"] = sorted({self.name(a) for a, refs in self.lowmem.items()
                                   if any(lo <= r <= hi for r, _k in refs)})
             c["hw_accesses"] = sorted({self.name(a) for a, refs in self.hw_accesses.items()

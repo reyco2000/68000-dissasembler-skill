@@ -60,6 +60,7 @@ class Instr:
     words: list = field(default_factory=list)
     trap: Optional[dict] = None     # A-line trap info
     opsize: int = 0                 # operand size in bytes (0 = unsized)
+    longs: list = field(default_factory=list)   # byte offsets of 32-bit extension fields
 
     @property
     def end(self) -> int:
@@ -91,10 +92,12 @@ def ea_address(op) -> Optional[int]:
 
 
 class _Decoder:
-    def __init__(self, pc: int, read_word):
+    def __init__(self, pc: int, read_word, linea=None):
         self.pc = pc
         self.rw = read_word
         self.words = []
+        self.longs = []
+        self.linea = linea or trap_info
 
     def word(self) -> int:
         a = self.pc + 2 * len(self.words)
@@ -105,6 +108,7 @@ class _Decoder:
         return w
 
     def long(self) -> int:
+        self.longs.append(2 * len(self.words))
         return (self.word() << 16) | self.word()
 
     def ext_addr(self) -> int:
@@ -194,12 +198,14 @@ class _Decoder:
         raise _Bad()
 
 
-def decode(pc: int, read_word) -> Optional[Instr]:
-    """Decode one instruction at pc. read_word(addr) -> 16-bit int or None."""
+def decode(pc: int, read_word, linea=None) -> Optional[Instr]:
+    """Decode one instruction at pc. read_word(addr) -> 16-bit int or None.
+    linea(word) -> info dict names line-A words (default: Macintosh traps;
+    see platforms.py)."""
     first = read_word(pc)
     if first is None:
         return None
-    d = _Decoder(pc, read_word)
+    d = _Decoder(pc, read_word, linea)
     try:
         ins = _decode(d)
     except _Bad:
@@ -208,6 +214,7 @@ def decode(pc: int, read_word) -> Optional[Instr]:
         return Instr(pc=pc, size=2, mnemonic="DC.W", ops=[("imm", first, 2)], valid=False, words=[first])
     ins.pc = pc
     ins.words = d.words
+    ins.longs = d.longs
     ins.size = 2 * len(d.words)
     ins.valid = True
     return ins
@@ -365,7 +372,7 @@ def _decode(d: _Decoder) -> Optional[Instr]:
 
     # ---------------- 1010: line A (Macintosh traps) ----------------
     if hi == 0xA:
-        t = trap_info(w)
+        t = d.linea(w)
         return _mk(t["ident"], [("trap", w)], 0, "stop" if t["noreturn"] else "seq", trap=t)
 
     # ---------------- 1011: CMP / CMPA / CMPM / EOR ----------------
@@ -598,13 +605,13 @@ def format_operand(op, sym=None) -> str:
         return f"{shex(op[1])}({reg_name(True, op[2])},{x})"
     if k == "absW":
         v = op[1]
-        n = sym(v, "absW") if (sym and v < 0x8000) else None
+        n = sym(ea_address(op), "absW") if sym else None
         if n:
             return f"({n}).W"
         return (f"(${v:04X})" if v < 0x8000 else f"($FFFF{v:04X})") + ".W"
     if k == "absL":
         v = op[1]
-        n = sym(v, "absL") if (sym and v <= ADDR_MASK) else None
+        n = sym(v, "absL") if sym else None
         return f"({n}).L" if n else f"(${v:08X}).L"
     if k == "d16PC":
         return f"{s(op[1], 'pc', hexs(op[1]))}(PC)"

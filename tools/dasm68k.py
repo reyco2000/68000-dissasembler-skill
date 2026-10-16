@@ -30,13 +30,17 @@ from collections import defaultdict
 try:
     from tools.m68k import decode, format_instr, ea_address, Instr, sext16
     from tools.macloader import load_image
+    from tools.m68k import format_operand
     from tools.symbols import load_symbols
-    from tools import macsyms
+    from tools import macsyms, atarisyms, platforms
 except ImportError:
     from m68k import decode, format_instr, ea_address, Instr, sext16
+    from m68k import format_operand
     from macloader import load_image
     from symbols import load_symbols
     import macsyms
+    import atarisyms
+    import platforms
 
 MASK = 0xFFFFFF
 TERMINAL_FLOWS = ("jump", "ret", "stop", "jump_ind")
@@ -194,8 +198,8 @@ def macsbug_name(mem: MemoryImage, a: int):
 class Disassembler68k:
     def __init__(self, mem: MemoryImage, entry_addr=None, entries=None, named_entries=None,
                  fill="validated", tables=None, symbols=None, data_regions=None,
-                 auto_tables=True, mac=False, rom=None, rom_base=None, jump_table=None,
-                 vector_table=False, segment=None, prologues=True):
+                 auto_tables=True, platform="generic", rom=None, rom_base=None, jump_table=None,
+                 vector_table=False, segment=None, prologues=True, prg=None, tos=None):
         self.mem = mem
         self.entry_addr = entry_addr
         self.entries = list(entries or [])
@@ -210,9 +214,19 @@ class Disassembler68k:
                 if mem.is_populated(a):
                     self.forced_data.add(a)
         self.auto_tables = auto_tables
-        self.mac = mac
+        self.plat = platforms.get(platform)
+        self.mac = self.plat.name == "mac"
+        self.atari = self.plat.name == "atari"
         self.rom = rom
-        self.rom_name = rom.get("rom_name") if rom else None
+        self.tos = tos                      # TOS ROM / cartridge header info (Atari)
+        self.rom_name = rom.get("rom_name") if rom else (tos.get("name") if tos else None)
+        # GEMDOS executable: relocations decide which longs are addresses
+        self.prg = prg
+        self.relocs: set[int] = set(prg["relocs"]) if prg else set()
+        self.reloc_bytes: dict[int, int] = {r + i: r for r in self.relocs for i in range(4)}
+        self._reloc_ctx = None
+        self._cur_pc = None
+        self.tos_calls: dict[int, tuple] = {}   # pc -> (system, name, fn)
         self.rom_base = rom_base
         self.jump_table = jump_table
         self.vector_table = vector_table
@@ -244,6 +258,7 @@ class Disassembler68k:
         self.used_hw: set[int] = set()
         self.used_user: set[int] = set()
         self.used_traps: dict[int, str] = {}           # word -> ident
+        self.bss_labels: dict[int, str] = {}
         self.mid_refs: dict[int, int] = {}
         self._analyzed = False
         self.lines = []
@@ -251,10 +266,15 @@ class Disassembler68k:
 
     # ---------------- decoding ----------------
 
+    linef_calls = False      # TOS 1.x: $Fxxx words are compact AES/VDI calls
+
     def decode(self, pc: int):
         ins = self._dcache.get(pc)
         if ins is None:
-            ins = decode(pc, self.mem.word_at)
+            ins = decode(pc, self.mem.word_at, self.plat.linea)
+            if ins is not None and not ins.valid and self.linef_calls and ins.words[0] >= 0xF000:
+                ins = Instr(pc=pc, size=2, mnemonic="DC.W", ops=[], valid=True, words=ins.words)
+                ins.linef = True
             if ins is not None:
                 self._dcache[pc] = ins
         return ins
@@ -264,6 +284,13 @@ class Disassembler68k:
             if a in self.owner or a in self.data_kind or a in self.forced_data \
                     or not self.mem.is_populated(a):
                 return False
+            # GEMDOS executable: a relocated long may only be a 32-bit
+            # extension field of this instruction; TEXT/DATA not crossed
+            r = self.reloc_bytes.get(a)
+            if r is not None and (r - ins.pc not in ins.longs or r + 4 > ins.end):
+                return False
+        if self.prg and ins.pc < self.prg["data_start"] < ins.end:
+            return False
         return True
 
     def _place(self, ins, traced: bool, swept: bool = False):
@@ -303,6 +330,7 @@ class Disassembler68k:
             pc = work.pop()
             lea = {}                        # An -> address loaded by LEA x(PC)/abs in this run
             prev = None
+            pushed = []                     # in-image addresses pushed on the stack in this run
             while True:
                 if pc & 1 or not self.mem.is_populated(pc) or pc in self.instrs:
                     break
@@ -339,8 +367,83 @@ class Disassembler68k:
                     self._check_macsbug(ins.end)
                 if ins.flow in TERMINAL_FLOWS:
                     break
+                if self.atari:
+                    a = self._pushed_address(ins)
+                    if a is not None:
+                        pushed.append(a)
+                    if ins.mnemonic == "TRAP":
+                        call = self._tos_call(ins, prev)
+                        if call:
+                            self.tos_calls[ins.pc] = call
+                            if self._tos_callback(call, pushed, work, ins.pc):
+                                pushed = []
+                            if call[0] == "GEMDOS" and call[2] in atarisyms.GEMDOS_NORETURN:
+                                self._check_macsbug(ins.end)
+                                break       # Pterm / Pterm0 / Ptermres
                 prev = ins
                 pc = ins.end
+
+    # ---------------- Atari TOS calls ----------------
+
+    def _pushed_address(self, ins):
+        """PEA x / MOVE.L #x,-(SP) of an even in-image address."""
+        a = None
+        if ins.mnemonic == "PEA" and ins.ops[0][0] in ("d16PC", "absL"):
+            a = ea_address(ins.ops[0])
+        elif ins.mnemonic == "MOVE.L" and ins.ops[1] == ("-(A)", 7) and ins.ops[0][0] == "imm":
+            a = ins.ops[0][1]
+        if a is not None and a <= MASK and not a & 1 and self.mem.is_populated(a):
+            return a
+        return None
+
+    def _tos_call(self, ins, prev):
+        """(system, name, fn) for TRAP #1/#13/#14 after MOVE.W #fn,-(SP)
+        (or CLR.W -(SP) = function 0), and TRAP #2 after D0 = 200 / 115."""
+        n = ins.ops[0][1]
+        if prev is None:
+            return None
+        if n == 2:
+            if prev.mnemonic in ("MOVE.W", "MOVEQ", "MOVE.L") and prev.ops[0][0] in ("imm", "simm") \
+                    and prev.ops[1] == ("D", 0) and prev.ops[0][1] in atarisyms.GEM_CALLS:
+                g = atarisyms.GEM_CALLS[prev.ops[0][1]]
+                return (g, f"{g} call", prev.ops[0][1])
+            return None
+        fn = None
+        if prev.mnemonic == "MOVE.W" and prev.ops[1] == ("-(A)", 7) and prev.ops[0][0] == "imm":
+            fn = prev.ops[0][1]
+        elif prev.mnemonic == "CLR.W" and prev.ops[0] == ("-(A)", 7):
+            fn = 0
+        if fn is None:
+            return None
+        r = atarisyms.call_name(n, fn)
+        return (r[0], r[1], fn) if r else None
+
+    def _tos_callback(self, call, pushed, work, pc) -> bool:
+        """Supexec(func), Setexc(n, vec), Xbtimer(.., vec), Mfpint(n, vec):
+        the pushed routine address is code."""
+        if not pushed or (call[0], call[1]) not in (("XBIOS", "Supexec"), ("BIOS", "Setexc"),
+                                                    ("XBIOS", "Xbtimer"), ("XBIOS", "Mfpint")):
+            return False
+        a = pushed[-1]
+        name = {"Supexec": "Supexec_Func", "Setexc": "Setexc_Handler", "Xbtimer": "Xbtimer_Handler",
+                "Mfpint": "Mfpint_Handler"}[call[1]]
+        if a not in self.named_entries:
+            self.named_entries[a] = name
+            self.descriptions[a] = f"passed to {call[0]} {call[1]} at ${pc:06X}"
+        self.call_targets.add(a)
+        work.append(a)
+        return True
+
+    def _find_tos_calls(self):
+        """TOS calls in swept / filled code (the tracer records traced ones)."""
+        for pc, ins in self.instrs.items():
+            if ins.mnemonic == "TRAP" and pc not in self.tos_calls:
+                p = self.owner.get(pc - 1)
+                prev = self.instrs.get(p) if p is not None else None
+                if prev is not None and prev.end == pc:
+                    call = self._tos_call(ins, prev)
+                    if call:
+                        self.tos_calls[pc] = call
 
     def _note_vector_install(self, ins, lea, work):
         """LEA x(PC),An / MOVE.L An,(vec).W  or  MOVE.L #x,(vec).W:
@@ -372,18 +475,16 @@ class Disassembler68k:
         if handler is None or handler & 1 or not self.mem.is_populated(handler):
             return
         name = None
-        if vec in macsyms.EXCEPTION_VECTORS:
-            name = macsyms.EXCEPTION_VECTORS[vec][0].replace("Vct", "") + "_Handler"
-        elif self.mac and vec in macsyms.LOWMEM:
-            lname = macsyms.LOWMEM[vec][0]
-            if lname.startswith("J") or lname.endswith(("Proc", "Hook", "Trans", "Task")):
-                name = lname + "_Proc"
+        if vec in self.plat.vectors and (self.plat.name != "generic" or self.vector_table or vec < 0x100):
+            name = self.plat.vectors[vec][0].replace("Vct", "").replace("Vec", "") + "_Handler"
+        elif vec in self.plat.hooks:
+            name = self.plat.lowmem[vec][0] + "_Proc"
         if name is None:
             return
         self.vector_installs.append((ins.pc, vec, handler))
         if handler not in self.named_entries:
             self.named_entries[handler] = name
-            self.descriptions[handler] = f"installed into {macsyms.EXCEPTION_VECTORS.get(vec, macsyms.LOWMEM.get(vec, ('?', '')))[0]}" \
+            self.descriptions[handler] = f"installed into {self.plat.lowmem_name(vec)}" \
                                          f" (${vec:04X}) at ${ins.pc:06X}"
         self.call_targets.add(handler)
         work.append(handler)
@@ -632,7 +733,7 @@ class Disassembler68k:
         info = {"addr": start, "entries": n, "stride": stride, "hits": hits, "targets": entries,
                 "trap_map": None}
         rom_size = sum(len(d) for _a, d in self.mem.segs)
-        if stride == 2 and n == 512 and rom_size == 0x10000:
+        if stride == 2 and n == 512 and rom_size == 0x10000 and self.mac:
             info["trap_map"] = "64K ROM layout: index < $50 = OS trap, else Toolbox trap (inferred)"
             for i, t in enumerate(entries):
                 name = macsyms.OS_TRAPS.get(i) if i < 0x50 else macsyms.TOOL_TRAPS.get(i)
@@ -779,6 +880,10 @@ class Disassembler68k:
             entries.append(a)
             self.call_targets.add(a)
         entries += self._mark_user_tables()
+        for r in self.relocs:
+            t = self.mem.long_at(r)
+            if t is not None and not t & 1 and self.prg["text_start"] <= t < self.prg["data_start"]:
+                self.code_hints.add(t)
         if not entries:
             r = self.mem.get_contiguous_ranges()
             if r:
@@ -786,7 +891,7 @@ class Disassembler68k:
         self._trace(list(reversed(entries)))
 
         def free_set():
-            return {a for a in self.mem.addresses() if self._free(a)}
+            return {a for a in self.mem.addresses() if self._free(a) and a not in self.reloc_bytes}
 
         # Sweep before string detection: 68000 code is often printable
         # ("Nu" = RTS), so text detection only gets what the sweep rejects
@@ -804,12 +909,42 @@ class Disassembler68k:
                 break
         if self.fill == "all":
             self._fill_linear()
+        if self.atari:
+            self._find_tos_calls()
+        # GEMDOS executable: relocated longs outside code are pointers
+        for r in sorted(self.relocs):
+            if r not in self.owner and all(r + i not in self.owner for i in range(4)):
+                t = self.mem.long_at(r)
+                self.table_entries[r] = (4, t, "long", None)
+                for i in range(4):
+                    self.data_kind[r + i] = "pointer"
         for a in self.mem.addresses():
             if a not in self.owner:
                 self.data_kind.setdefault(a, "byte")
         self._make_labels()
 
+    def in_bss(self, addr: int) -> bool:
+        return bool(self.prg) and self.prg["bss_start"] <= addr <= self.prg["bss_end"]
+
     def _make_labels(self):
+        if self.prg:
+            for r in self.relocs:
+                t = self.mem.long_at(r)
+                if t is None:
+                    continue
+                if self.mem.is_populated(t):
+                    self.data_refs[t].append(self.owner.get(r, r))
+                else:
+                    self.bss_labels.setdefault(t, None)
+            for pc, ins in self.instrs.items():
+                for op in ins.ops:
+                    if op[0] in ("d16PC", "idxPC", "branch"):
+                        a = ea_address(op)
+                        if not self.mem.is_populated(a):
+                            self.bss_labels.setdefault(a, None)
+            for a in list(self.bss_labels):
+                n = self.sym.name(a) if self.sym.name(a) and "+" not in self.sym.name(a) else None
+                self.bss_labels[a] = n or self.named_entries.get(a) or f"B_{a:06X}"
         for addr in list(self.data_refs):
             if not self.mem.is_populated(addr) or addr in self.labels:
                 continue
@@ -866,6 +1001,9 @@ class Disassembler68k:
 
     # ---------------- naming ----------------
 
+    def _vectors_on(self) -> bool:
+        return self.plat.name != "generic" or self.vector_table
+
     def known_name(self, addr: int):
         """Name of an address outside generated labels: user > built-in."""
         n = self.sym.name(addr)
@@ -873,13 +1011,15 @@ class Disassembler68k:
             return n
         if addr in self.named_entries:
             return self.named_entries[addr]
+        if addr in self.bss_labels:
+            return self.bss_labels[addr]
         if not self.mem.is_populated(addr):
-            if addr in macsyms.EXCEPTION_VECTORS and (self.mac or self.vector_table):
-                return macsyms.EXCEPTION_VECTORS[addr][0]
-            if self.mac and addr in macsyms.LOWMEM:
-                return macsyms.LOWMEM[addr][0]
-            if self.mac and addr in macsyms.HARDWARE:
-                return macsyms.HARDWARE[addr][0]
+            if addr in self.plat.vectors and self._vectors_on():
+                return self.plat.vectors[addr][0]
+            if addr in self.plat.lowmem:
+                return self.plat.lowmem[addr][0]
+            if addr in self.plat.hardware:
+                return self.plat.hardware[addr][0]
         return None
 
     def describe(self, addr: int) -> str:
@@ -889,8 +1029,9 @@ class Disassembler68k:
         if addr in self.descriptions:
             return self.descriptions[addr]
         if not self.mem.is_populated(addr):
-            for tbl in ((macsyms.LOWMEM, macsyms.HARDWARE) if self.mac else ()) + \
-                       ((macsyms.EXCEPTION_VECTORS,) if (self.mac or self.vector_table) else ()):
+            if addr in self.plat.vectors and self._vectors_on():
+                return self.plat.vectors[addr][1]
+            for tbl in (self.plat.lowmem, self.plat.hardware):
                 if addr in tbl:
                     return tbl[addr][1]
         return ""
@@ -914,34 +1055,86 @@ class Disassembler68k:
         return n
 
     def _sym(self, addr: int, kind: str):
+        plat = self.plat
+        # sign-extended hardware equates ($FFFF8240): usable as (x).W and (x).L
+        if kind == "absL" and addr > MASK:
+            a = addr & MASK
+            if plat.hw_sext and a in plat.hardware and plat.hw_equate(a) == addr:
+                self.used_hw.add(a)
+                return plat.hardware[a][0]
+            return None
         if addr > MASK:
+            return None
+        if kind == "absW" and addr >= 0x8000:
+            if plat.hw_sext and addr in plat.hardware:
+                self.used_hw.add(addr)
+                return plat.hardware[addr][0]
+            return None
+        # GEMDOS executable: only relocated longs may name image / BSS addresses
+        if self.prg and kind in ("absL", "imm") and not self._reloc_ctx and \
+                (self.mem.is_populated(addr) or self.in_bss(addr)):
             return None
         if self.mem.is_populated(addr):
             if addr in self.labels:
                 return self.labels[addr]
             return self._user_ref(addr)
+        if addr in self.bss_labels:
+            return self.bss_labels[addr]
+        if self.prg and kind in ("pc", "branch") and self._cur_pc is not None:
+            d = addr - self._cur_pc
+            return f"*+${d:X}" if d >= 0 else f"*-${-d:X}"
         u = self._user_ref(addr)
         if u:
             return u
         if kind in ("absW", "absL"):
-            if (self.mac or self.vector_table) and addr in macsyms.EXCEPTION_VECTORS:
+            if self._vectors_on() and addr in plat.vectors:
                 self.used_lowmem.add(addr)
-                return macsyms.EXCEPTION_VECTORS[addr][0]
-            if self.mac and addr in macsyms.LOWMEM:
+                return plat.vectors[addr][0]
+            if addr in plat.lowmem:
                 self.used_lowmem.add(addr)
-                return macsyms.LOWMEM[addr][0]
-            if self.mac and addr in macsyms.HARDWARE and kind == "absL":
+                return plat.lowmem[addr][0]
+            if kind == "absL" and addr in plat.hardware and not plat.hw_sext:
                 self.used_hw.add(addr)
-                return macsyms.HARDWARE[addr][0]
+                return plat.hardware[addr][0]
         return None
+
+    def _format(self, ins):
+        """(mnemonic, operands) with relocation context per long operand."""
+        if not ins.valid or ins.trap:
+            return format_instr(ins, self._sym)
+        if ins.mnemonic == "DC.W":                       # line-F word traced as code
+            return "DC.W", f"${ins.words[0]:04X}"
+        self._cur_pc = ins.pc
+        parts, li = [], 0
+        for op in ins.ops:
+            if op[0] == "absL" or (op[0] == "imm" and op[2] == 4):
+                pos = ins.pc + ins.longs[li] if li < len(ins.longs) else None
+                li += 1
+                self._reloc_ctx = pos in self.relocs if self.prg else None
+            else:
+                self._reloc_ctx = None
+            parts.append(format_operand(op, self._sym))
+        self._reloc_ctx = None
+        self._cur_pc = None
+        return ins.mnemonic, ",".join(parts)
 
     def operand_comment(self, ins) -> str:
         if ins.trap:
             t = ins.trap
             extra = ""
-            if t["name"].startswith("Pack") and t["name"][4:].isdigit():
+            if self.mac and t["name"].startswith("Pack") and t["name"][4:].isdigit():
                 extra = f": {macsyms.PACK_NAMES.get(int(t['name'][4:]), '')}"
+            elif t.get("desc"):
+                extra = f": {t['desc']}"
             return f"; {t['display']} ({t['manager']}{extra})"
+        if ins.pc in self.tos_calls:
+            sysname, name, fn = self.tos_calls[ins.pc]
+            if sysname in ("AES", "VDI"):
+                return f"; {sysname} call (parameter block in D1)"
+            d = atarisyms.CALL_DESC.get(name)
+            return f"; {sysname} {name} (function ${fn:02X})" + (f": {d}" if d else "")
+        if getattr(ins, "linef", False):
+            return "; line-F word (TOS 1.x: compact AES/VDI subroutine call)"
         for op in ins.ops:
             if op[0] in ("absW", "absL"):
                 a = ea_address(op)
@@ -950,16 +1143,12 @@ class Disassembler68k:
                 c = self.sym.comment(a)
                 if c:
                     return f"; {c}"
-                if self.mac and a in macsyms.LOWMEM:
-                    return f"; {macsyms.LOWMEM[a][1]}"
-                if self.mac and a in macsyms.HARDWARE:
-                    return f"; {macsyms.HARDWARE[a][1]}"
-                if (self.mac or self.vector_table) and a in macsyms.EXCEPTION_VECTORS:
-                    return f"; {macsyms.EXCEPTION_VECTORS[a][1]}"
-                if self.mac:
-                    r = macsyms.hw_region(a)
-                    if r:
-                        return f"; {r[1]}"
+                d = self.describe(a)
+                if d:
+                    return f"; {d}"
+                d = self.plat.hw_desc(a) if a >= 0x400000 else None
+                if d:
+                    return f"; {d}"
             elif op[0] == "d16A" and op[2] == 5 and self.jump_table:
                 for e in self.jump_table:
                     if e["a5_offset"] == op[1] and ins.mnemonic in ("JSR", "JMP", "PEA"):
@@ -1004,7 +1193,7 @@ class Disassembler68k:
             while pc <= re_:
                 if pc in self.instrs:
                     ins = self.instrs[pc]
-                    mn, opnd = format_instr(ins, self._sym)
+                    mn, opnd = self._format(ins)
                     comment = self.operand_comment(ins)
                     if annotate:
                         if ins.mnemonic in ("JSR", "BSR.S", "BSR.W", "JMP") and ins.target is not None \
@@ -1023,7 +1212,12 @@ class Disassembler68k:
                     continue
                 if pc in self.table_entries:
                     size, tgt, kind, base = self.table_entries[pc]
-                    s = self._sym(tgt, "absL") or f"${tgt:06X}"
+                    if kind == "rel":
+                        s = self.labels.get(tgt) or f"${tgt:06X}"
+                    else:
+                        self._reloc_ctx = (pc in self.relocs) if self.prg else None
+                        s = self._sym(tgt, "absL") or f"${tgt:06X}"
+                        self._reloc_ctx = None
                     raw = bytes(self.mem.byte_at(pc + i) for i in range(size))
                     if kind == "rel":
                         bl = self.labels.get(base) or f"${base:06X}"
@@ -1112,22 +1306,39 @@ class Disassembler68k:
         out = []
         line_starts = {pc for (pc, *_r) in self.lines}
         out.append("; =============================================")
-        out.append("; 68000 disassembly (vasm Motorola syntax: vasmm68k_mot -Fbin -no-opt -m68000)")
+        if self.prg:
+            flags = f" -tos-flags={self.prg['flags']}" if self.prg["flags"] else ""
+            out.append(f"; 68000 disassembly (vasm Motorola syntax: vasmm68k_mot -Ftos -nosym -no-opt"
+                       f" -m68000{flags})")
+        else:
+            out.append("; 68000 disassembly (vasm Motorola syntax: vasmm68k_mot -Fbin -no-opt -m68000)")
         out.append("; =============================================")
-        if self.rom_name:
+        out.append(f"; Platform: {self.plat.name} ({self.plat.title})")
+        if self.rom_name and self.rom:
             r = self.rom
             out.append(f"; ROM image: {self.rom_name}")
             out.append(f"; ROM checksum ${r['checksum']:08X} ({'valid' if r['checksum_ok'] else 'mismatch'}),"
                        f" version ${r['version']:04X}, reset PC ${r['reset_pc']:06X}")
+        elif self.rom_name and self.tos:
+            out.append(f"; ROM image: {self.rom_name}")
+            for line in self.tos.get("summary", []):
+                out.append(f"; {line}")
+        if self.prg:
+            p = self.prg
+            out.append("; Relocatable GEMDOS executable (TEXT/DATA/BSS sections)")
+            out.append(f"; TEXT ${p['text_len']:X} bytes, DATA ${p['data_len']:X}, BSS ${p['bss_len']:X},"
+                       f" {len(self.relocs)} relocations, program flags ${p['flags']:X}"
+                       + (f", symbol table ${p['sym_len']:X} bytes (not rebuilt)" if p["sym_len"] else ""))
         out.append("                 MC68000")
         out.append("")
 
         if self.used_traps:
             out.append("; =============================================")
-            out.append("; A-line traps (Macintosh Toolbox / OS)")
+            out.append({"mac": "; A-line traps (Macintosh Toolbox / OS)",
+                        "atari": "; Line-A graphics calls"}.get(self.plat.name, "; Line-A words"))
             out.append("; =============================================")
             for word in sorted(self.used_traps):
-                t = macsyms.trap_info(word)
+                t = self.plat.linea(word)
                 out.append(f"{t['ident']:16s} MACRO")
                 out.append(f"                 DC.W    ${word:04X}          ; {t['display']} - {t['manager']}")
                 out.append("                 ENDM")
@@ -1141,17 +1352,19 @@ class Disassembler68k:
             out.append("; =============================================")
             for a in addrs:
                 n, d = table[a]
-                fmt = f"${a:04X}" if a < 0x10000 else f"${a:06X}"
+                v = self.plat.hw_equate(a) if table is self.plat.hardware else a
+                fmt = f"${v:04X}" if v < 0x10000 else (f"${v:06X}" if v <= MASK else f"${v:08X}")
                 out.append(f"{n:16s} EQU     {fmt}" + (f"  ; {d}" if d else ""))
             out.append("")
 
+        plat = self.plat
         lm = sorted(a for a in self.used_lowmem if not self.mem.is_populated(a))
-        vecs = [a for a in lm if a in macsyms.EXCEPTION_VECTORS and
-                macsyms.EXCEPTION_VECTORS[a][0] == self._sym(a, "absW")]
-        equ_block("68000 exception vectors", vecs, macsyms.EXCEPTION_VECTORS)
-        equ_block("Low-memory system globals", [a for a in lm if a not in vecs], macsyms.LOWMEM)
-        equ_block("Hardware (Mac 128K / 512K / Plus)",
-                  sorted(a for a in self.used_hw if not self.mem.is_populated(a)), macsyms.HARDWARE)
+        vecs = [a for a in lm if a in plat.vectors and self._vectors_on()]
+        equ_block("Exception vectors", vecs, plat.vectors)
+        equ_block({"mac": "Low-memory system globals", "atari": "TOS system variables"}.get(
+            plat.name, "System variables"), [a for a in lm if a not in vecs], plat.lowmem)
+        equ_block(f"Hardware ({plat.title})",
+                  sorted(a for a in self.used_hw if not self.mem.is_populated(a)), plat.hardware)
         ue = sorted(a for a in self.used_user if not self.mem.is_populated(a))
         equ_block("User symbols", ue, {a: (self.sym.name(a), self.sym.comment(a)) for a in ue})
 
@@ -1166,6 +1379,10 @@ class Disassembler68k:
                 if cover is not None and cover in line_starts and cover in self.instrs:
                     out.append(f"{self.labels[addr]:16s} EQU     {self.labels[cover]}+{addr - cover}"
                                f"  ; inside {self.instrs[cover].mnemonic} at ${cover:06X}")
+                elif self.prg:
+                    base = max((a for a in line_starts if a <= addr and a in self.labels), default=None)
+                    out.append(f"{self.labels[addr]:16s} EQU     {self.labels[base]}+{addr - base}"
+                               if base is not None else f"{self.labels[addr]:16s} EQU     ${addr:06X}")
                 else:
                     out.append(f"{self.labels[addr]:16s} EQU     ${addr:06X}")
             out.append("")
@@ -1198,13 +1415,19 @@ class Disassembler68k:
         prev_end = None
         prev_was_data = False
         for (pc, hex_bytes, mnemonic, operand, comment) in self.lines:
-            if prev_end is None or pc > prev_end + 1:
+            if self.prg:
+                if prev_end is None or pc == self.prg["data_start"]:
+                    out.append("")
+                    out.append("                 " + ("TEXT" if prev_end is None and
+                                                     pc < self.prg["data_start"] else "DATA"))
+                    out.append("")
+            elif prev_end is None or pc > prev_end + 1:
                 out.append("")
                 out.append(f"                 ORG     ${pc:06X}")
                 out.append("")
             label_str = self.labels.get(pc, "")
             if annotate:
-                is_data = mnemonic.startswith(("DC.", "DCB."))
+                is_data = mnemonic.startswith(("DC.", "DCB.")) and pc not in self.instrs
                 if label_str.startswith("SUB_") or (label_str and pc in self.call_targets
                                                     and not label_str.startswith(("L_", "D_"))):
                     d = self.describe(pc)
@@ -1235,7 +1458,34 @@ class Disassembler68k:
                 lab = f"{label_str}:" if label_str else ""
                 out.append(f"{lab:16s} {instr}{comment}")
             prev_end = pc + self.line_len[pc] - 1
+        if self.prg:
+            out += self._bss_lines(show_hex)
         return "\n".join(line.rstrip() for line in out) + "\n"
+
+    def _bss_lines(self, show_hex: bool) -> list:
+        """BSS section: DS.B runs with a label at every referenced address;
+        references past the end become EQUs relative to the last label."""
+        p = self.prg
+        out = ["", "                 BSS", ""]
+        start, end = p["bss_start"], p["bss_start"] + p["bss_len"]
+        pos = start
+        inside = sorted(a for a in self.bss_labels if start <= a <= end)
+        beyond = sorted(a for a in self.bss_labels if a > end or a < start)
+        for a in sorted(set(inside) | {end}):
+            if a > pos:
+                txt = f"{'':16s} DS.B    {a - pos}"
+                out.append(f"  {pos:06X}  {'':{HEX_COL}s}  DS.B    {a - pos}" if show_hex else txt)
+                pos = a
+            if a in self.bss_labels:
+                out.append(f"{self.bss_labels[a]}:")
+        if beyond:
+            anchor = self.bss_labels.get(end)
+            if anchor is None:
+                anchor = "BSS_END"
+                out.append(f"{anchor}:")
+            for a in beyond:
+                out.append(f"{self.bss_labels[a]:16s} EQU     {anchor}{a - end:+d}")
+        return out
 
 
 # ===========================================================================
@@ -1288,14 +1538,32 @@ def build_disassembler(args):
     tables = [parse_table_spec(t) for t in args.table]
     fill = "none" if args.no_fill else args.fill
     rom_base = info["segments"][0]["org"] if info.get("is_rom") else None
+    platform = getattr(args, "platform", "auto") or "auto"
+    if args.mac:
+        platform = "mac"
+    if getattr(args, "atari", False):
+        platform = "atari"
+    if platform == "auto":
+        platform = info.get("platform") or ("mac" if info.get("mac") else "generic")
+    info["platform"] = platform
     dasm = Disassembler68k(
         mem, entry_addr=info.get("entry"), entries=args.entry, named_entries=named, fill=fill,
         tables=tables, symbols=load_symbols(args.symbols), data_regions=regions,
-        auto_tables=not args.no_auto_tables, mac=info.get("mac") or args.mac,
+        auto_tables=not args.no_auto_tables, platform=platform,
+        prg=info.get("prg"), tos=info.get("tos"),
         rom=info.get("rom"), rom_base=rom_base, jump_table=info.get("jump_table"),
         vector_table=bool(info.get("vector_table")), prologues=not args.no_prologues,
         segment=(info["resource"]["id"], info["segments"][0]["org"])
         if info.get("resource", {}).get("type") == "CODE" else None)
+    # GEMDOS symbol table: names for everything, code hints for TEXT symbols
+    for a, n, seg in info.get("prg_symbols", []):
+        if a not in dasm.sym.by_addr and n not in dasm.sym.by_name:
+            dasm.sym.by_addr[a] = (n, f"{seg} symbol")
+            dasm.sym.by_name[n] = a
+        if seg == "text":
+            dasm.code_hints.add(a)
+    tos = info.get("tos") or {}
+    dasm.linef_calls = tos.get("kind") == "rom" and tos.get("version", 0x200) < 0x200 and not tos.get("emutos")
     if info.get("entry") is not None and info.get("is_rom"):
         dasm.named_entries.setdefault(info["entry"], "ResetEntry")
         dasm.descriptions.setdefault(info["entry"], "reset entry (ROM header reset PC)")
@@ -1306,14 +1574,19 @@ def build_disassembler(args):
 
 
 def add_common_args(parser):
-    parser.add_argument("file", help="Mac ROM image, resource file / MacBinary, S-record, Intel HEX or raw binary")
+    parser.add_argument("file", help="Mac ROM, Atari TOS ROM / cartridge / PRG / boot sector, resource "
+                                     "file / MacBinary, S-record, Intel HEX or raw binary")
     parser.add_argument("--org", type=lambda x: int(x, 0), default=None,
-                        help="Load address (e.g. 0x400000); auto for Mac ROMs, S-records, resources (0)")
+                        help="Load address (e.g. 0x400000); auto for ROMs, S-records; $10000 for "
+                             "resources, GEMDOS executables and boot sectors")
     parser.add_argument("--raw", action="store_true", help="Skip ROM / container detection")
     parser.add_argument("--rom", action="store_true", help="Treat a raw image as a Mac ROM (no checksum match)")
     parser.add_argument("--rsrc", metavar="TYPE:ID", help="Resource to disassemble from a resource fork")
-    parser.add_argument("--mac", action="store_true",
-                        help="Use Mac low-memory / hardware names for a raw binary")
+    parser.add_argument("--platform", choices=["auto", "mac", "atari", "generic"], default="auto",
+                        help="Symbol set: Mac or Atari ST system variables, hardware and line-A "
+                             "meaning (default: from the input format)")
+    parser.add_argument("--mac", action="store_true", help="Same as --platform mac")
+    parser.add_argument("--atari", action="store_true", help="Same as --platform atari")
     parser.add_argument("--entry", type=lambda x: int(x, 0), action="append", default=[],
                         help="Extra entry point to trace from (repeatable)")
     parser.add_argument("--table", action="append", default=[], metavar="ADDR:COUNT[:long|word|rel|rel=BASE]",

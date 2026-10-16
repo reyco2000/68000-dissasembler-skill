@@ -11,6 +11,10 @@ Builds (all original code, no Apple ROM content):
                      ROM-relative dispatch table, an embedded resource map,
                      Pascal strings and a MacsBug symbol
   roms/demo.rsrc     a resource fork with CODE 0 (jump table), CODE 1 and STR
+  roms/hello.prg     Atari ST GEMDOS executable (tests/fixtures/hello_st.s), no symbols
+  roms/hello_sym.prg the same with a DRI/GST symbol table
+  roms/faketos.img   an 8K "TOS 1.04-style" ROM at $FC0000: OSHEADER, vector and
+                     MFP installs, palette / YM2149 / ACIA access, a line-F word
 """
 
 import os
@@ -27,13 +31,65 @@ from tools.macsyms import mac_rom_checksum   # noqa: E402
 VASM = os.environ.get("VASM", "vasmm68k_mot")
 
 
-def assemble(src: str) -> bytes:
+def assemble(src: str, fmt=("-Fbin",)) -> bytes:
     with tempfile.TemporaryDirectory() as d:
         s, b = os.path.join(d, "x.s"), os.path.join(d, "x.bin")
         with open(s, "w") as f:
             f.write(src)
-        subprocess.run([VASM, "-quiet", "-Fbin", "-no-opt", "-m68000", "-o", b, s], check=True)
-        return open(b, "rb").read()
+        subprocess.run([VASM, "-quiet", *fmt, "-no-opt", "-m68000", "-o", b, s], check=True)
+        with open(b, "rb") as f:
+            return f.read()
+
+
+FAKETOS = """
+        MC68000
+        ORG     $FC0000
+OSHeader:
+        BRA.S   OSEntry                 ; os_entry
+        DC.W    $0104                   ; os_version
+        DC.L    Reset                   ; reseth
+        DC.L    OSHeader                ; os_beg
+        DC.L    $00004000               ; os_end
+        DC.L    0                       ; os_rsv1
+        DC.L    0                       ; os_magic
+        DC.L    $04061989               ; os_date (BCD MMDDYYYY)
+        DC.W    $0007                   ; os_conf: UK, PAL
+        DC.W    $1286                   ; os_dosdate
+        DC.L    0,0,0,0                 ; p_root, pkbshift, p_run, reserved
+OSEntry:
+        BRA.W   Reset
+Reset:  MOVE.W  #$2700,SR
+        MOVE.B  #$0A,($FFFF8001).W      ; memconf
+        MOVE.L  #$31415926,D0
+        CMP.L   ($00000426).W,D0        ; resvalid
+        BNE.S   .noreset
+        MOVEA.L ($0000042A).W,A0        ; resvector
+        JMP     (A0)
+.noreset:
+        LEA     ($FFFF8240).W,A0
+        MOVE.W  #$0777,(A0)+
+        MOVE.W  #$0700,(A0)
+        MOVE.B  #2,($FFFF8260).W        ; high resolution
+        MOVE.L  #VBL,($00000070).W
+        MOVE.L  #TimerC,($00000114).W
+        LEA     ($FFFFFA00).W,A1
+        MOVE.B  #$48,$17(A1)            ; MFP vr: vector base $40, software EOI
+        MOVE.B  #$20,$09(A1)            ; ierb: Timer C
+        MOVE.B  #7,($FFFF8800).W        ; YM register 7 (mixer)
+        MOVE.B  #$C0,($FFFF8802).W
+        MOVE.B  #$03,($FFFFFC00).W      ; keyboard ACIA master reset
+        DC.W    $F004                   ; line-F call (TOS 1.x AES style)
+        MOVE.W  #$2300,SR
+.idle:  STOP    #$2300
+        BRA.S   .idle
+VBL:    ADDQ.L  #1,($00000462).W        ; _vbclock
+        RTE
+TimerC: ADDQ.L  #1,($000004BA).W        ; _hz_200
+        BCLR    #5,($FFFFFA11).W        ; isrb: end of interrupt
+        RTE
+        DC.B    'faketos',0
+        DCB.B   $FC2000-*,$FF
+"""
 
 
 def fakerom_source() -> str:
@@ -222,7 +278,12 @@ def main():
         open(os.path.join(roms, "allmodes.bin"), "wb").write(assemble(f.read()))
     open(os.path.join(roms, "fakerom.bin"), "wb").write(build_fakerom())
     open(os.path.join(roms, "demo.rsrc"), "wb").write(build_rsrc())
-    print("built roms/allmodes.bin roms/fakerom.bin roms/demo.rsrc")
+    with open(os.path.join(HERE, "hello_st.s")) as f:
+        st = f.read()
+    open(os.path.join(roms, "hello.prg"), "wb").write(assemble(st, ("-Ftos", "-nosym")))
+    open(os.path.join(roms, "hello_sym.prg"), "wb").write(assemble(st, ("-Ftos",)))
+    open(os.path.join(roms, "faketos.img"), "wb").write(assemble(FAKETOS))
+    print("built roms/allmodes.bin fakerom.bin demo.rsrc hello.prg hello_sym.prg faketos.img")
 
 
 if __name__ == "__main__":

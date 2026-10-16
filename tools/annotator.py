@@ -21,9 +21,10 @@ Chunk file layout (written by split, relied on by merge):
 --reassemble strips the address/hex columns on merge so the annotated file
 assembles with vasm back to the original bytes.
 
-The annotator's lookup tables come from the markdown tables in reference/
-(mac_traps.md, mac_lowmem.md, mac_hardware.md): extend those files to
-extend coverage without code changes.
+The annotator's lookup tables come from the markdown tables in reference/,
+chosen by the listing's "; Platform:" header line: mac_lowmem.md /
+mac_hardware.md for Mac listings, atari_sysvars.md / atari_hardware.md for
+Atari ones. Extend those files to extend coverage without code changes.
 """
 
 import sys
@@ -33,9 +34,10 @@ import argparse
 import re
 
 try:
-    from tools import macsyms
+    from tools import macsyms, atarisyms
 except ImportError:
     import macsyms
+    import atarisyms
 
 CODE_MARKER = "; --- BEGIN CODE ---"
 
@@ -44,7 +46,9 @@ CODE_MARKER = "; --- BEGIN CODE ---"
 LINE_RE = re.compile(r'^  ([0-9A-F]{6})  ([0-9A-F. ]{24})  (\S.*?)\s*$')
 INSTR_RE = re.compile(r"^([A-Z_][A-Za-z0-9_.]*)(?:\s+((?:'[^']*'|[^;'])*?))?\s*(;.*)?$")
 LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*:$')
-ORG_RE = re.compile(r'^\s*ORG\s+\$', re.IGNORECASE)
+ORG_RE = re.compile(r'^\s*(ORG\s+\$|TEXT\s*$|DATA\s*$|BSS\s*$)', re.IGNORECASE)
+PLATFORM_RE = re.compile(r'^; Platform: (\w+)')
+RELOC_MARK = "; Relocatable GEMDOS executable"
 
 PACK_SELECTORS = {
     2: {0: "DIBadMount", 2: "DILoad", 4: "DIUnload", 6: "DIFormat", 8: "DIVerify", 10: "DIZero"},
@@ -54,6 +58,14 @@ PACK_SELECTORS = {
     7: {0: "NumToString", 1: "StringToNum"},
 }
 SCC_OFFSETS = {o: (n, d) for o, n, d in macsyms.SCC_REGS}
+
+
+def listing_platform(lines) -> str:
+    for line in lines[:40]:
+        m = PLATFORM_RE.match(line)
+        if m:
+            return m.group(1)
+    return "generic"
 
 
 def extract_header(asm_lines):
@@ -135,12 +147,19 @@ class PatternAnnotator:
     annotate_file() rewrites a chunk in place and is idempotent."""
 
     def __init__(self, ref_dir: str):
+        self.ref_dir = ref_dir
+        self.platform = None
+        self.file_names = {}
+
+    def set_platform(self, platform: str):
+        if platform == self.platform:
+            return
+        self.platform = platform
         self.traps = {}       # word -> (name, manager)
         self.lowmem = {}      # addr -> (name, desc)
         self.hw = {}          # addr -> (name, desc)
         self.names = {}       # name -> addr (all tables)
-        self.file_names = {}
-        self._load_references(ref_dir)
+        self._load_references(self.ref_dir)
 
     @staticmethod
     def _rows(path):
@@ -154,8 +173,14 @@ class PatternAnnotator:
                     yield parts[0], parts[1], parts[2]
 
     def _load_references(self, ref_dir):
-        for fn, tbl in (("mac_traps.md", self.traps), ("mac_lowmem.md", self.lowmem),
-                        ("mac_hardware.md", self.hw)):
+        if self.platform == "atari":
+            files = (("atari_sysvars.md", self.lowmem), ("atari_hardware.md", self.hw))
+        elif self.platform == "mac":
+            files = (("mac_traps.md", self.traps), ("mac_lowmem.md", self.lowmem),
+                     ("mac_hardware.md", self.hw))
+        else:
+            files = ()
+        for fn, tbl in files:
             p = os.path.join(ref_dir, fn)
             if not os.path.exists(p):
                 continue
@@ -164,10 +189,14 @@ class PatternAnnotator:
                 if m:
                     tbl[int(m.group(1), 16)] = (name, desc)
         # fall back to the built-in tables when reference/ is missing
-        if not self.lowmem:
+        if not self.lowmem and self.platform == "mac":
             self.lowmem = {**macsyms.EXCEPTION_VECTORS, **macsyms.LOWMEM}
-        if not self.hw:
+        if not self.hw and self.platform == "mac":
             self.hw = dict(macsyms.HARDWARE)
+        if not self.lowmem and self.platform == "atari":
+            self.lowmem = {**atarisyms.VECTORS, **atarisyms.SYSVARS}
+        if not self.hw and self.platform == "atari":
+            self.hw = dict(atarisyms.HARDWARE)
         for tbl in (self.lowmem, self.hw):
             for a, (n, _d) in tbl.items():
                 self.names.setdefault(n, a)
@@ -197,7 +226,7 @@ class PatternAnnotator:
         if m:
             base = self.file_names.get(m.group(1), self.names.get(m.group(1)))
             if base is not None:
-                return base + int(m.group(2) or 0)
+                return (base + int(m.group(2) or 0)) & 0xFFFFFF
         return None
 
     @staticmethod
@@ -232,6 +261,7 @@ class PatternAnnotator:
     def annotate_file(self, filepath: str) -> int:
         with open(filepath) as f:
             lines = f.readlines()
+        self.set_platform(listing_platform(lines))
         self.file_names = self.names_from_file(lines)
         ranges = memory_ranges_from_header(lines)
         is_rom = any(l.startswith("; ROM image:") for l in lines[:60])
@@ -299,6 +329,18 @@ class PatternAnnotator:
                 kind = "SCCRd"
             elif v == macsyms.SCC_WR:
                 kind = "SCCWr"
+        if not kind:
+            # any constant hardware base: LEA (x).W/(x).L, MOVEA.L #x, MOVEA.W #x
+            v = None
+            if mn == "LEA" and a is not None:
+                v = a
+            m = re.match(r'^#\$([0-9A-F]+)$', src)
+            if m and mn in ("MOVEA.L", "MOVEA.W"):
+                v = int(m.group(1), 16)
+                if mn == "MOVEA.W" and v & 0x8000:
+                    v |= 0xFF0000
+            if v is not None and (v & 0xFFFFFF) >= 0x400000:
+                kind = ("BASE", v & 0xFFFFFF)
         if kind:
             regs[dst] = kind
         else:
@@ -314,6 +356,12 @@ class PatternAnnotator:
             if m.group(1) and m.group(1).startswith("-"):
                 off = -int(m.group(1)[2:], 16)
             kind = regs[m.group(2)]
+            if isinstance(kind, tuple):
+                a = (kind[1] + off) & 0xFFFFFF
+                if a in self.hw:
+                    n, d = self.hw[a]
+                    return "BASE", off, f"{n}: {d}"
+                continue
             if kind == "VIA":
                 r = macsyms.via_reg_by_offset(off)
                 if r:
@@ -374,6 +422,19 @@ class PatternAnnotator:
                 return f"; {desc} - {'enable' if v & 0x80 else 'disable'} mask ${v & 0x7F:02X}"
             return f"; {desc}"
 
+        # Atari: YM2149 register select, resolution, palette
+        if self.platform == "atari" and ops and len(ops) == 2 and ops[0].startswith("#$"):
+            dst = self.addr_of(ops[1])
+            v = int(ops[0][2:], 16)
+            if dst == 0xFF8800 and mn == "MOVE.B" and v < 16:
+                return f"; YM2149 select register {v}: {atarisyms.YM_REGS[v]}"
+            if dst == 0xFF8260 and mn == "MOVE.B":
+                return f"; resolution = {['low (320x200x16)', 'medium (640x200x4)', 'high (640x400 mono)'][v] if v < 3 else v}"
+            if dst is not None and 0xFF8240 <= dst <= 0xFF825E and mn == "MOVE.W":
+                return f"; palette color {(dst - 0xFF8240) // 2} = ${v & 0xFFF:03X} (0RGB)"
+            if dst == 0xFFFC02 and mn == "MOVE.B":
+                return f"; IKBD command ${v:02X}"
+
         # Status register / interrupt level
         if mn == "MOVE.W" and op.endswith(",SR") and op.startswith("#$"):
             v = int(op[2:6], 16)
@@ -416,8 +477,9 @@ class PatternAnnotator:
             a = self.addr_of(part)
             if a is None or in_image(a):
                 continue
-            if a in macsyms.EXCEPTION_VECTORS and i_op == len(ops) - 1 and base == "MOVE":
-                v = macsyms.EXCEPTION_VECTORS[a]
+            vectors = atarisyms.VECTORS if self.platform == "atari" else macsyms.EXCEPTION_VECTORS
+            if a in vectors and i_op == len(ops) - 1 and base == "MOVE":
+                v = vectors[a]
                 return f"; install handler into {v[0]}" + ("" if has_comment else f": {v[1]}")
             if a in self.lowmem and not has_comment:
                 n, d = self.lowmem[a]
@@ -470,6 +532,7 @@ def do_split(args):
     os.makedirs(args.output_dir, exist_ok=True)
     header_lines, first_code_idx = extract_header(asm_lines)
     header_text = "".join(header_lines)
+    relocatable = any(l.startswith(RELOC_MARK) for l in header_lines)
     manifest = {"source_asm": os.path.abspath(args.asm), "source_sections": os.path.abspath(args.sections),
                 "total_chunks": len(sections), "chunks": []}
     for n, section in enumerate(sections):
@@ -491,7 +554,7 @@ def do_split(args):
         ctx = ["; =============================================",
                f"; CHUNK {chunk_id} of {len(sections)} -- {start_hex} to {end_hex} ({len(chunk_lines)} lines)",
                "; ============================================="]
-        for key, title, limit in (("subroutines", "Subroutines", 40), ("traps", "Traps", 40),
+        for key, title, limit in (("subroutines", "Subroutines", 40), ("traps", "Traps / system calls", 40),
                                   ("lowmem", "Low-memory globals", 40), ("hw_accesses", "Hardware", 30),
                                   ("self_modifying", "Self-modified", 20), ("calls_out", "Calls out", 15),
                                   ("called_from", "Called from", 10)):
@@ -508,7 +571,7 @@ def do_split(args):
             f.write("\n")
             f.write("\n".join(ctx) + "\n")
             f.write(CODE_MARKER + "\n")
-            if not any(ORG_RE.match(l) for l in chunk_lines[:6]):
+            if not relocatable and not any(ORG_RE.match(l) for l in chunk_lines[:6]):
                 f.write(f"                 ORG     ${start_addr:06X}\n\n")
             f.write("".join(chunk_lines))
         manifest["chunks"].append({

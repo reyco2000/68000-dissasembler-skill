@@ -21,7 +21,7 @@ from the image itself. Run every command from the repository root.
      embedded resource maps.
 
 2. **Build the map**:
-   `python3 tools/macrommap.py <rom> <flags> --output output/<name>_map.md --json output/<name>_map.json`
+   `python3 tools/rommap.py <rom> <flags> --output output/<name>_map.md --json output/<name>_map.json`
    (`<flags>` as for disassembly: usually none for a ROM; add `--symbols
    output/<name>_symbols.json` once it exists.) Read the map, not the full
    listing. It contains:

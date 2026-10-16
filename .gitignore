@@ -10,6 +10,9 @@ roms/*
 !roms/fakerom.bin
 !roms/allmodes.bin
 !roms/demo.rsrc
+!roms/hello.prg
+!roms/hello_sym.prg
+!roms/faketos.img
 
 # Generated listings (may contain disassembled copyrighted code)
 output/*

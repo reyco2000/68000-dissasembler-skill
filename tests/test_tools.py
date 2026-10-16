@@ -22,13 +22,13 @@ from argparse import Namespace
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from tools import macsyms                                     # noqa: E402
+from tools import macsyms, atarisyms                          # noqa: E402
 from tools.m68k import decode, format_instr                   # noqa: E402
 from tools.macloader import (identify_file, parse_srecord, parse_ihex,  # noqa: E402
                              parse_macbinary)
 from tools.dasm68k import build_disassembler, MemoryImage, Disassembler68k  # noqa: E402
 from tools.xref import CrossReferenceBuilder                  # noqa: E402
-from tools.macrommap import build_map, to_markdown            # noqa: E402
+from tools.rommap import build_map, to_markdown               # noqa: E402
 from tools import annotator                                   # noqa: E402
 from tools.symbols import load_symbols                        # noqa: E402
 
@@ -36,6 +36,9 @@ ROMS = os.path.join(ROOT, "roms")
 FAKEROM = os.path.join(ROMS, "fakerom.bin")
 ALLMODES = os.path.join(ROMS, "allmodes.bin")
 DEMO_RSRC = os.path.join(ROMS, "demo.rsrc")
+HELLO_PRG = os.path.join(ROMS, "hello.prg")
+HELLO_SYM = os.path.join(ROMS, "hello_sym.prg")
+FAKETOS = os.path.join(ROMS, "faketos.img")
 VASM = os.environ.get("VASM") or shutil.which("vasmm68k_mot")
 
 
@@ -47,7 +50,8 @@ def dis(words, pc=0x1000):
 
 
 def args_for(path, **kw):
-    a = dict(file=path, org=None, raw=False, rom=False, rsrc=None, mac=False, entry=[], table=[],
+    a = dict(file=path, org=None, raw=False, rom=False, rsrc=None, mac=False, atari=False,
+             platform="auto", entry=[], table=[],
              symbols=[], data_region=[], fill="validated", no_fill=False, no_auto_tables=False,
              no_prologues=False)
     a.update(kw)
@@ -173,10 +177,12 @@ class TestMacSyms(unittest.TestCase):
 
     def test_reference_tables_in_sync(self):
         """reference/*.md tables are generated from macsyms.py."""
-        for kind, fn in (("traps", "mac_traps.md"), ("lowmem", "mac_lowmem.md"),
-                         ("hardware", "mac_hardware.md")):
-            gen = {"traps": macsyms.markdown_traps, "lowmem": macsyms.markdown_lowmem,
-                   "hardware": macsyms.markdown_hardware}[kind]()
+        for gen_fn, fn in ((macsyms.markdown_traps, "mac_traps.md"), (macsyms.markdown_lowmem, "mac_lowmem.md"),
+                           (macsyms.markdown_hardware, "mac_hardware.md"),
+                           (atarisyms.markdown_calls, "atari_tos_calls.md"),
+                           (atarisyms.markdown_sysvars, "atari_sysvars.md"),
+                           (atarisyms.markdown_hardware, "atari_hardware.md")):
+            gen = gen_fn()
             with open(os.path.join(ROOT, "reference", fn)) as f:
                 self.assertIn(gen.strip(), f.read(), f"regenerate reference/{fn}")
 
@@ -447,6 +453,112 @@ class TestSymbols(unittest.TestCase):
 
 
 # ======================================================================
+class TestAtari(unittest.TestCase):
+    def test_tos_identity(self):
+        info = identify_file(FAKETOS)
+        self.assertEqual(info["format"], "atari-tos-rom")
+        t = info["tos"]
+        self.assertEqual((t["version"], t["date"], t["country"], t["pal"], t["os_beg"]),
+                         (0x0104, "1989-04-06", "UK", True, 0xFC0000))
+        self.assertEqual(info["entry"], 0xFC0034)
+
+    def test_tos_listing(self):
+        d, _ = build_disassembler(args_for(FAKETOS))
+        out = d.disassemble(annotate=True)
+        self.assertIn("; Platform: atari", out)
+        self.assertIn("color0           EQU     $FFFF8240", out)
+        self.assertIn("MOVE.B  #$02,(shiftmd).W", out)
+        self.assertIn("MOVE.L  #MFP_TimerC_Handler,(MFP_TimerC).W", out)
+        self.assertIn("CMP.L   (resvalid).W,D0", out)
+        self.assertIn("BCLR    #$5,(isrb).W", out)
+        self.assertIn("line-F word", out)
+        self.assertIn("MOVE.W  #$2300,SR", out)          # tracing continued past line-F
+        self.assertIn("_LineA", "".join(atarisyms.linea_info(0xA000)["ident"]))
+
+    def test_prg_loader(self):
+        info = identify_file(HELLO_PRG)
+        self.assertEqual(info["format"], "atari-gemdos-executable")
+        p = info["prg"]
+        self.assertEqual((p["text_len"], p["data_len"], p["bss_len"], len(p["relocs"])), (154, 48, 260, 9))
+        info = identify_file(HELLO_SYM)
+        names = {n for _a, n, _s in info["prg_symbols"]}
+        self.assertTrue({"start", "super_init", "hello", "counter", "bufend"} <= names)
+
+    def test_prg_listing(self):
+        d, _ = build_disassembler(args_for(HELLO_PRG))
+        out = d.disassemble(annotate=True)
+        self.assertIn("TRAP    #1                        ; GEMDOS Cconws (function $09)", out)
+        self.assertIn("PEA     Supexec_Func(PC)", out)
+        self.assertIn("MOVE.L  #VBL_Handler,(VBLVec).W", out)
+        self.assertIn("MOVE.L  #B_0100CA,D0", out)              # relocated immediate -> BSS label
+        self.assertIn("DC.L    L_01008E", out)                  # relocated data pointer
+        self.assertIn("DC.W    $0001,$0000", out)               # unrelocated long stays a number
+        self.assertIn("DC.B    'never reached'", out)           # nothing traced after Pterm0
+        self.assertIn("\n                 BSS\n", out)
+        d, _ = build_disassembler(args_for(HELLO_SYM))
+        out = d.disassemble()
+        for n in ("super_init:", "dispatch:", "counter:", "MOVE.L  #counter,D0"):
+            self.assertIn(n, out)
+        x = CrossReferenceBuilder(d)
+        x.analyze()
+        self.assertEqual(sorted(x.sys_calls), ["GEMDOS Cconws", "GEMDOS Crawcin", "GEMDOS Pterm0",
+                                               "XBIOS Supexec"])
+
+    def test_cartridge_and_boot_sector(self):
+        cart = bytearray(0x200)
+        struct.pack_into(">IIII", cart, 0, 0xABCDEF42, 0, 0x08FA0040, 0x00FA0040)
+        cart[24:24 + 8] = b"DEMO.PRG"
+        cart[0x40:0x44] = bytes.fromhex("70014E75")
+        boot = bytearray(512)
+        boot[0:2] = bytes.fromhex("6038")
+        boot[0x3A:0x40] = bytes.fromhex("4E714E714E75")
+        struct.pack_into(">H", boot, 510, (0x1234 - sum(struct.unpack(">255H", boot[:510]))) & 0xFFFF)
+        with tempfile.TemporaryDirectory() as tmp:
+            c, b = os.path.join(tmp, "c.stc"), os.path.join(tmp, "boot.bin")
+            with open(c, "wb") as f:
+                f.write(cart)
+            with open(b, "wb") as f:
+                f.write(boot)
+            info = identify_file(c)
+            self.assertEqual(info["format"], "atari-cartridge")
+            self.assertIn((0xFA0040, "CA_DEMO_PRG_Run"), info["entries"])
+            info = identify_file(b)
+            self.assertEqual(info["format"], "atari-boot-sector")
+            d, _ = build_disassembler(args_for(b))
+            self.assertIn("NOP", d.disassemble())
+
+    def test_atari_annotator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d, _ = build_disassembler(args_for(FAKETOS))
+            asm = os.path.join(tmp, "t.asm")
+            with open(asm, "w") as f:
+                f.write(d.disassemble(annotate=True))
+            man = os.path.join(tmp, "manifest.json")
+            with open(man, "w") as f:
+                json.dump({"chunks": [{"id": 0, "filename": "t.asm", "path": asm,
+                                       "start_addr": "0xFC0000", "end_addr": "0xFC1FFF"}]}, f)
+            err, sys.stderr = sys.stderr, io.StringIO()
+            try:
+                annotator.do_annotate(Namespace(manifest=man, ref_dir=os.path.join(ROOT, "reference")))
+            finally:
+                sys.stderr = err
+            text = slurp(asm)
+        self.assertIn("vr: MFP vector register", text)
+        self.assertIn("ierb: MFP interrupt enable B", text)
+        self.assertIn("YM2149 select register 7: mixer", text)
+        self.assertIn("resolution = high (640x400 mono)", text)
+
+    def test_map(self):
+        d, info = build_disassembler(args_for(FAKETOS))
+        x = CrossReferenceBuilder(d)
+        x.analyze()
+        md = to_markdown(build_map(d, info, x))
+        self.assertIn("| TOS version word ($02) | $0104 |", md)
+        self.assertIn("Machine Address Map (Atari ST / STE)", md)
+        self.assertIn("| MFP |", md)
+
+
+# ======================================================================
 @unittest.skipUnless(VASM, "vasmm68k_mot not installed")
 class TestRoundTrip(unittest.TestCase):
     def roundtrip(self, path, **kw):
@@ -490,16 +602,35 @@ class TestRoundTrip(unittest.TestCase):
         """Any byte sequence must reassemble byte-exact, in every mode."""
         modes = [dict(raw=True, org=0x10000, fill="all", mac=True),
                  dict(raw=True, org=0x400000),
-                 dict(raw=True, org=0, fill="all", mac=True)]
-        for seed in range(9):
+                 dict(raw=True, org=0, fill="all", mac=True),
+                 dict(raw=True, org=0x10000, fill="all", atari=True),
+                 dict(raw=True, org=0xFC0000, atari=True)]
+        for seed in range(10):
             r = random.Random(seed)
             data = bytes(r.randrange(256) for _ in range(6000 + seed))
             with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as t:
                 t.write(data)
             try:
-                self.roundtrip(t.name, **modes[seed % 3])
+                self.roundtrip(t.name, **modes[seed % len(modes)])
             finally:
                 os.unlink(t.name)
+
+    def test_atari_tos_rom(self):
+        self.roundtrip(FAKETOS)
+
+    def test_gemdos_executable(self):
+        for path in (HELLO_PRG, HELLO_SYM):
+            d, _ = build_disassembler(args_for(path))
+            src = d.disassemble(show_hex=False)
+            with tempfile.TemporaryDirectory() as tmp:
+                s_, b = os.path.join(tmp, "x.s"), os.path.join(tmp, "x.prg")
+                with open(s_, "w") as f:
+                    f.write(src)
+                subprocess.run([VASM, "-quiet", "-Ftos", "-nosym", "-no-opt", "-m68000", "-o", b, s_],
+                               check=True, capture_output=True)
+                out = slurp(b, "rb")
+            # the symbol-table build compares against the stripped original
+            self.assertEqual(out, slurp(HELLO_PRG, "rb"), path)
 
     def test_annotated_pipeline_reassembles(self):
         here = os.getcwd()

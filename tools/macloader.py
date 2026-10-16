@@ -31,10 +31,11 @@ import struct
 import sys
 
 try:
-    from tools import macsyms
+    from tools import macsyms, atarisyms
     from tools.m68k import decode
 except ImportError:
     import macsyms
+    import atarisyms
     from m68k import decode
 
 ROM_BASE = 0x400000
@@ -422,6 +423,48 @@ def identify_file(path: str, org: int | None = None, raw: bool = False,
                         info["entries"].append((r["addr"], _ident(f"R_{r['type']}_{r['id']}")))
             return done([(base, data)])
 
+        # ---- Atari: TOS ROM, cartridge, GEMDOS executable, boot sector ----
+        tos = identify_tos_rom(data, org)
+        if tos:
+            base = tos["os_beg"]
+            info.update(format="atari-tos-rom", is_rom=True, platform="atari", tos=tos,
+                        rom_name=tos["name"], entry=tos["reseth"])
+            info["entries"] += [(tos["reseth"], "ResetEntry")]
+            if tos["entry_bra"] != tos["reseth"]:
+                info["entries"].append((tos["entry_bra"], "OS_Entry"))
+            info["entries"].append((base, "OS_Header"))
+            info["data_regions"].append((base + 2, base + tos["header_end"] - 1, "TOS header (OSHEADER)"))
+            info["notes"] += tos["summary"]
+            return done([(base, data)])
+        cart = identify_cartridge(data) if org in (None, CART_BASE) else None
+        if cart:
+            info.update(format="atari-cartridge", is_rom=True, platform="atari", tos=cart,
+                        rom_name=cart["name"])
+            info["entries"] += cart["entries"]
+            for a, b in cart["headers"]:
+                info["data_regions"].append((CART_BASE + a, CART_BASE + b, "cartridge header"))
+            for app in cart["apps"]:
+                info["notes"].append(f"Cartridge application '{app['name']}': init ${app['init']:08X}, "
+                                     f"run ${app['run']:08X}, size {app['size']}")
+            if cart["entries"]:
+                info["entry"] = cart["entries"][0][0]
+            return done([(CART_BASE, data)])
+        prg = parse_prg(data)
+        if prg:
+            return _load_prg(info, prg, org, done)
+        if is_boot_sector(data[:512]) and (len(data) == 512 or (len(data) % 512 == 0 and len(data) >= 0x5A000)):
+            base = org if org is not None else EXEC_BASE
+            sector = data[:512]
+            tgt = _bra_target(sector, 0)
+            info.update(format="atari-boot-sector", platform="atari", entry=base)
+            if tgt is not None and 2 < tgt < 512:
+                info["data_regions"].append((base + 2, base + min(tgt, 0x1E) - 1,
+                                             "boot sector BPB: OEM, serial, bytes/sector ..."))
+            info["data_regions"].append((base + 0x1FE, base + 0x1FF, "boot sector checksum word"))
+            info["notes"].append("Executable boot sector (word sum $1234)"
+                                 + ("" if len(data) == 512 else ": first sector of a disk image"))
+            return done([(base, sector)])
+
         # ---- S-records / Intel HEX ----
         if data[:1] in (b"S", b":"):
             try:
@@ -493,6 +536,34 @@ def _vectors_into(info, segs):
                                  f"{len(vt) - 1} other vectors in image")
 
 
+def _load_prg(info, prg, org, done):
+    """Load TEXT+DATA at base with relocations applied (they are the ground
+    truth for which longs are addresses)."""
+    base = org if org is not None else EXEC_BASE
+    body = bytearray(prg["body"])
+    for off in prg["relocs_off"]:
+        v = (be32(body, off) + base) & 0xFFFFFFFF
+        struct.pack_into(">I", body, off, v)
+    tlen, dlen, blen = prg["text_len"], prg["data_len"], prg["bss_len"]
+    info.update(format="atari-gemdos-executable", platform="atari", entry=base)
+    info["entries"].append((base, "PrgStart"))
+    info["prg"] = {"relocs": [base + o for o in prg["relocs_off"]], "text_start": base,
+                   "data_start": base + tlen, "bss_start": base + tlen + dlen,
+                   "bss_end": base + tlen + dlen + blen, "text_len": tlen, "data_len": dlen,
+                   "bss_len": blen, "flags": prg["flags"], "sym_len": prg["sym_len"]}
+    syms = parse_dri_symbols(prg["symtab"], tlen, dlen)
+    info["prg_symbols"] = [(base + o, n, seg) for o, n, seg in syms]
+    info["notes"].append(f"GEMDOS executable: TEXT ${tlen:X}, DATA ${dlen:X}, BSS ${blen:X}, "
+                         f"{len(prg['relocs_off'])} relocations, flags ${prg['flags']:X}"
+                         + (f", {len(syms)} symbols" if syms else "")
+                         + (f", res1 ${prg['res1']:X}" if prg["res1"] else ""))
+    if prg["trailing"]:
+        info["notes"].append(f"{prg['trailing']} bytes after the relocation table (not loaded)")
+    if not tlen + dlen:
+        raise SystemExit("GEMDOS executable has no TEXT or DATA")
+    return done([(base, bytes(body))])
+
+
 def _load_resource(info, res, rsrc, org, container, done):
     info["mac"] = True
     info["resources"] = [{k: v for k, v in r.items() if k != "data"} for r in res]
@@ -561,6 +632,160 @@ def _parse_jump_table(d: bytes):
     return out
 
 
+# ===========================================================================
+# ATARI ST
+# ===========================================================================
+
+TOS_BASES = (0xFC0000, 0xE00000)
+CART_BASE = 0xFA0000
+EXEC_BASE = 0x10000          # default load address for PRG files and boot sectors
+
+
+def _bra_target(data: bytes, off: int = 0):
+    w = be16(data, off)
+    if w & 0xFF00 != 0x6000:
+        return None
+    d = w & 0xFF
+    if d == 0:
+        return off + 2 + struct.unpack_from(">h", data, off + 2)[0]
+    if d == 0xFF:
+        return None
+    return off + 2 + (d - 256 if d & 0x80 else d)
+
+
+def identify_tos_rom(data: bytes, org: int | None = None):
+    """TOS (or EmuTOS) ROM: BRA at 0, os_beg at 8 = $FC0000 / $E00000 (or
+    --org), reset handler at 4 inside the image."""
+    if len(data) < 0x30:
+        return None
+    tgt = _bra_target(data, 0)
+    os_beg, reseth = be32(data, 8), be32(data, 4) & 0xFFFFFF
+    if tgt is None or not 4 <= tgt < 0x100:
+        return None
+    if os_beg not in TOS_BASES and os_beg != org:
+        return None
+    if org is not None and org != os_beg:
+        return None
+    if not os_beg <= reseth < os_beg + len(data) or reseth & 1:
+        return None
+    version, date, conf = be16(data, 2), be32(data, 0x18), be16(data, 0x1C)
+    emutos = data[0x2C:0x30] == b"ETOS"
+    country = conf >> 1
+    cname = "multilanguage" if country == 127 else (atarisyms.COUNTRIES[country]
+                                                    if country < len(atarisyms.COUNTRIES) else f"country {country}")
+    vname = atarisyms.TOS_VERSIONS.get(version, f"TOS {version >> 8}.{version & 0xFF:02X}")
+    name = (f"EmuTOS (reports {vname.split(' (')[0]})" if emutos else vname) + \
+        f", {cname}, {'PAL' if conf & 1 else 'NTSC'}, {len(data) // 1024}K"
+    summary = [f"TOS header: version ${version:04X}, date {atarisyms.bcd_date(date)}, "
+               f"os_beg ${os_beg:06X}, reset handler ${reseth:06X}, os_conf ${conf:04X}"]
+    return {"name": name, "version": version, "date": atarisyms.bcd_date(date), "country": cname,
+            "pal": bool(conf & 1), "os_beg": os_beg, "reseth": reseth, "entry_bra": os_beg + tgt,
+            "header_end": tgt, "emutos": emutos, "os_end": be32(data, 0x0C), "summary": summary,
+            "kind": "rom"}
+
+
+def identify_cartridge(data: bytes):
+    """ROM cartridge at $FA0000: $ABCDEF42 + application headers, or the
+    $FA52235F diagnostic cartridge (code at +4)."""
+    if len(data) < 8:
+        return None
+    magic = be32(data, 0)
+    if magic == 0xFA52235F:
+        return {"name": "diagnostic cartridge", "kind": "cartridge", "apps": [],
+                "entries": [(CART_BASE + 4, "Diag_Entry")], "headers": [(0, 3)], "summary": []}
+    if magic != 0xABCDEF42:
+        return None
+    apps, entries, headers = [], [], []
+    off, seen = 4, set()
+    while 0 <= off < len(data) - 34 and off not in seen:
+        seen.add(off)
+        nxt, init, run = be32(data, off), be32(data, off + 4), be32(data, off + 8)
+        size = be32(data, off + 16)
+        fname = data[off + 20:off + 34].split(b"\0")[0].decode("latin-1", "replace")
+        apps.append({"name": fname, "init": init, "run": run, "size": size})
+        headers.append((off, off + 33))
+        ident = "".join(c if c.isalnum() else "_" for c in fname) or f"app{len(apps)}"
+        for a, kind in ((run & 0xFFFFFF, "Run"), (init & 0xFFFFFF, "Init")):
+            if CART_BASE <= a < CART_BASE + len(data) and not a & 1:
+                entries.append((a, f"CA_{ident}_{kind}"))
+        if not nxt:
+            break
+        off = (nxt & 0xFFFFFF) - CART_BASE
+    return {"name": f"ROM cartridge: {', '.join(a['name'] for a in apps)}", "kind": "cartridge",
+            "apps": apps, "entries": entries, "headers": [(0, 3)] + headers, "summary": []}
+
+
+def parse_prg(data: bytes):
+    """GEMDOS executable: 28-byte header ($601A), TEXT, DATA, symbol table,
+    relocation table. Returns a dict or None."""
+    if len(data) < 28 or be16(data, 0) != 0x601A:
+        return None
+    tlen, dlen, blen, slen = struct.unpack_from(">IIII", data, 2)
+    res1, flags, absflag = be32(data, 18), be32(data, 22), be16(data, 26)
+    if 28 + tlen + dlen + slen > len(data) or tlen > 0x1000000 or blen > 0x1000000:
+        return None
+    body = data[28:28 + tlen + dlen]
+    sym = data[28 + tlen + dlen:28 + tlen + dlen + slen]
+    p = 28 + tlen + dlen + slen
+    relocs = []
+    if absflag == 0 and p + 4 <= len(data):
+        off = be32(data, p)
+        p += 4
+        if off:
+            if off + 4 > len(body) or off & 1:
+                return None
+            relocs.append(off)
+            while p < len(data):
+                b = data[p]
+                p += 1
+                if b == 0:
+                    break
+                if b == 1:
+                    off += 254
+                    continue
+                off += b
+                if off + 4 > len(body) or b & 1:
+                    return None
+                relocs.append(off)
+    return {"text_len": tlen, "data_len": dlen, "bss_len": blen, "sym_len": slen, "res1": res1,
+            "flags": flags, "absflag": absflag, "body": body, "symtab": sym, "relocs_off": relocs,
+            "trailing": max(0, len(data) - p)}
+
+
+DRI_TEXT, DRI_DATA, DRI_BSS, DRI_GSTLONG = 0x0200, 0x0400, 0x0100, 0x0048
+
+
+def parse_dri_symbols(sym: bytes, tlen: int, dlen: int):
+    """DRI / GST symbol table -> [(offset from TEXT start, name, segment)].
+    Data / BSS values may be section- or text-relative; both are handled."""
+    out, i = [], 0
+    while i + 14 <= len(sym):
+        name = sym[i:i + 8]
+        typ = be16(sym, i + 8)
+        val = be32(sym, i + 10)
+        i += 14
+        if typ & DRI_GSTLONG == DRI_GSTLONG and i + 14 <= len(sym):
+            name += sym[i:i + 14]
+            i += 14
+        name = name.split(b"\0")[0].decode("latin-1", "replace")
+        if typ & DRI_TEXT:
+            seg, off = "text", val
+        elif typ & DRI_DATA:
+            seg, off = "data", val if val >= tlen else tlen + val
+        elif typ & DRI_BSS:
+            seg, off = "bss", val if val >= tlen + dlen else tlen + dlen + val
+        else:
+            continue
+        ident = "".join(c if c.isalnum() or c == "_" else "_" for c in name)
+        if ident and not ident[0].isdigit():
+            out.append((off, ident, seg))
+    return out
+
+
+def is_boot_sector(sector: bytes) -> bool:
+    return len(sector) >= 512 and sum(be16(sector, i) for i in range(0, 512, 2)) & 0xFFFF == 0x1234
+
+
 def load_image(path: str, org: int | None = None, raw: bool = False, rsrc: str | None = None,
                rom: bool = False):
     info = identify_file(path, org=org, raw=raw, rsrc=rsrc, rom=rom)
@@ -571,7 +796,14 @@ def load_image(path: str, org: int | None = None, raw: bool = False, rsrc: str |
 def print_report(info: dict):
     print(f"File:    {info['file']} ({info['size']} bytes)")
     print(f"Format:  {info['format']}")
-    if info.get("rom_name"):
+    if info.get("tos"):
+        print(f"Atari:   {info['rom_name'] or info['tos'].get('name')}")
+    if info.get("prg"):
+        p = info["prg"]
+        print(f"PRG:     TEXT ${p['text_start']:06X} ({p['text_len']}), DATA ${p['data_start']:06X} "
+              f"({p['data_len']}), BSS ${p['bss_start']:06X} ({p['bss_len']}), "
+              f"{len(p['relocs'])} relocations, flags ${p['flags']:X}")
+    if info.get("rom_name") and info.get("rom"):
         r = info["rom"]
         print(f"ROM:     {info['rom_name']}")
         print(f"         checksum ${r['checksum']:08X} ({'valid' if r['checksum_ok'] else 'MISMATCH'}), "

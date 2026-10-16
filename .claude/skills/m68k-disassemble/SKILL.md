@@ -1,9 +1,9 @@
 ---
 name: m68k-disassemble
-description: "Use when the user asks to disassemble, reverse-engineer, or annotate Motorola 68000 code: Macintosh 128K/512K/Plus ROMs, Mac applications / resources (CODE, DRVR, PACK, INIT ...), MacBinary or AppleSingle files, S-records, Intel HEX, or raw 68000 binaries and SBC ROMs."
+description: "Use when the user asks to disassemble, reverse-engineer, or annotate Motorola 68000 code: Macintosh 128K/512K/Plus ROMs, Mac applications / resources (CODE, DRVR, PACK, INIT ...), MacBinary or AppleSingle files, Atari ST TOS ROMs, cartridges, GEMDOS programs (.PRG/.TOS/.TTP/.APP/.ACC) and boot sectors, S-records, Intel HEX, or raw 68000 binaries and SBC ROMs."
 ---
 
-# Disassemble 68000 / Macintosh Code
+# Disassemble 68000 / Macintosh / Atari ST Code
 
 Produces annotated **vasm Motorola-syntax** assembly via a chunked pipeline
 that keeps the main agent's context small: read only tool stdout and the
@@ -26,6 +26,15 @@ the listing.
      two-chip dump must be interleaved first (see
      `reference/mac_rom_notes.md`). For a ROM, also run the `mac-rom-map`
      skill.
+   - **Atari TOS ROM / EmuTOS** (OSHEADER at 0, base $FC0000 or $E00000) and
+     **cartridges** ($FA0000): detected automatically; traced from the reset
+     handler and cartridge entries. Also run the `atari-tos-map` skill.
+   - **Atari GEMDOS executable** (`.PRG` `.TOS` `.TTP` `.APP` `.ACC`, $601A
+     header): TEXT+DATA load at $10000 with relocations applied. Relocated
+     longs become labels and nothing else does; a DRI / GST symbol table
+     names routines and variables. Output uses TEXT / DATA / BSS sections.
+   - **Atari boot sector** (512 bytes, or the first sector of a `.ST` image)
+     with the executable checksum $1234: loads at $10000.
    - **Resource fork / MacBinary / AppleSingle**: the loader lists resources.
      Pick one with `--rsrc TYPE:ID` (default: lowest CODE >= 1). CODE
      segments get their jump-table entries (from CODE 0) as `JT_nnn` entry
@@ -36,11 +45,15 @@ the listing.
    - **Raw binary**: pass `--org <addr>`. An image at 0 that starts with a
      68000 vector table (SSP, PC) gets its reset PC and vectors traced
      (typical for 68000 SBC ROMs). Ask the user for the load address if it
-     isn't obvious. Add `--mac` if it is Mac code (low-memory and hardware
-     names).
+     isn't obvious. Add `--platform mac` / `--platform atari` (or `--mac`,
+     `--atari`) for Mac or Atari code: system variables, hardware names,
+     line-A meaning and TOS call names.
    - **Extra entry points**: `--entry 0xNNNNNN` (repeatable) for code reached
      only indirectly (trap implementations, callbacks, handlers patched into
-     RAM).
+     RAM). Recognized automatically: handlers installed into vectors or
+     hooks, `JSR (An)` after `LEA x,An`, Atari `Supexec` / `Setexc` /
+     `Xbtimer` / `Mfpint` callbacks, and routines that start with a
+     `LINK` / `MOVEM.L ...,-(SP)` prologue (`--no-prologues` turns that off).
    - **Dispatch tables**: `--table ADDR:COUNT[:long|word|rel|rel=BASE]`
      (hex ADDR): `long` = 32-bit addresses, `rel` = 16-bit offsets from the
      table (or from BASE). Recognized automatically: `JMP tbl(PC,Dn)` into a
@@ -80,9 +93,11 @@ the listing.
    subroutines, traps, low-memory globals, hardware, self-modifying code).
 
 6. **Python annotation**: `python3 tools/annotator.py --annotate --manifest output/<name>_chunks/manifest.json --ref-dir reference/`
-   - Zero-LLM-token pattern rules: VIA / IWM / SCC register access through a
-     base register (`MOVEA.L (VIA).W,A1` then `$1C00(A1)` = vIER, including
-     VIA port bit names), interrupt masking via SR, vector installs,
+   - Zero-LLM-token pattern rules: hardware register access through a base
+     register (Mac `MOVEA.L (VIA).W,A1` then `$1C00(A1)` = vIER, including
+     VIA port bit names; Atari `LEA ($FFFFFA00).W,A1` then `$17(A1)` = MFP
+     vr), YM2149 register selects, resolution / palette writes, IKBD
+     commands, interrupt masking via SR, vector installs,
      `_Pack` selectors, Pascal result space and returns, frames and register
      saves, copy / clear loops, ROM85 version checks, self-modifying code.
 
@@ -116,18 +131,24 @@ the listing.
 8. **Merge**: `python3 tools/annotator.py --merge --manifest output/<name>_chunks/manifest.json --output output/<name>_annotated.asm`
    - For a rebuildable copy add `--reassemble --output output/<name>_annotated.s`;
      `vasmm68k_mot -Fbin -no-opt -m68000 -o x.bin output/<name>_annotated.s`
-     gives back the original bytes (`-no-opt` is required).
+     gives back the original bytes (`-no-opt` is required). GEMDOS
+     executables rebuild with `-Ftos -nosym` instead of `-Fbin` (the exact
+     command is in the listing header).
 
 9. **Save the flags** to `output/<name>_flags.txt`.
 
 10. **Present findings** from the manifest and tool stdout only: format and
     load address, ROM identity / checksum, chunk count and total lines, key
-    subroutines, traps used (by manager), low-memory globals and hardware
-    touched, vector installs, auto-detected tables, output paths.
+    subroutines, traps / TOS system calls used, low-memory globals or system
+    variables and hardware touched, vector installs, auto-detected tables,
+    output paths.
 
 ## References
 
 - `reference/mac_traps.md`: every A-trap with its manager (parsed by the annotator)
+- `reference/atari_tos_calls.md`: GEMDOS / BIOS / XBIOS functions, AES / VDI, Line-A
+- `reference/atari_sysvars.md`, `reference/atari_hardware.md`: Atari vectors, system variables, ST / STE registers (parsed)
+- `reference/atari_st_notes.md`: TOS header, PRG format, calls, interrupts, hardware
 - `reference/mac_lowmem.md`: exception vectors and system globals (parsed)
 - `reference/mac_hardware.md`: VIA, IWM, SCC, SCSI registers (parsed)
 - `reference/mac_rom_notes.md`: ROM families, header, address map, trap dispatch, calling conventions
@@ -135,9 +156,10 @@ the listing.
 
 ## Output
 
-vasm Motorola syntax: `MC68000`, one macro per A-trap word (`_GetResource`,
-`_Read_ASYNC`, ...), `EQU` blocks for low-memory globals, vectors, hardware and
-user symbols, `ORG` per region, `SUB_xxxxxx` / `L_xxxxxx` / `D_xxxxxx` labels
+vasm Motorola syntax: `MC68000`, one macro per line-A word (Mac traps such as
+`_GetResource`, `_Read_ASYNC`; Atari `_LineA_Init`), `EQU` blocks for
+vectors, system variables, hardware (Atari: sign-extended `$FFFF8240`) and
+user symbols, `ORG` per region (TEXT / DATA / BSS for GEMDOS executables), `SUB_xxxxxx` / `L_xxxxxx` / `D_xxxxxx` labels
 (or real names), explicit sizes everywhere (`BRA.S`, `($016A).W`,
 `($00400000).L`), `DC.B` text with Pascal strings marked, `DC.W` / `DC.L` data
 and tables, `DCB.B` fills.
