@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Apple ROMs are copyrighted: supply your own (see README).
+# Only the synthetic test fixtures are committed.
+roms/*
+!roms/.gitkeep
+!roms/fakerom.bin
+!roms/allmodes.bin
+!roms/demo.rsrc
+
+# Generated listings (may contain disassembled copyrighted code)
+output/*
+!output/.gitkeep
+
+# Local Claude Code settings
+.claude/settings.local.json
