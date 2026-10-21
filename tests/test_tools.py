@@ -632,6 +632,71 @@ class TestRoundTrip(unittest.TestCase):
             # the symbol-table build compares against the stripped original
             self.assertEqual(out, slurp(HELLO_PRG, "rb"), path)
 
+    def test_packed_trap_table_and_patches(self):
+        """64K-ROM style packed trap table init + _SetTrapAddress patches."""
+        src = """
+        MC68000
+        ORG     $400000
+        DC.L    0,Reset
+        DC.W    $0069
+Reset:  LEA     ($0400).W,A1
+        LEA     Unimpl(PC),A0
+        SUBA.L  ($02AE).W,A0
+        MOVE.L  A0,D0
+        LSR.W   #1,D0
+        MOVEA.L A1,A0
+        MOVE.W  #$01FF,D1
+.fill:  MOVE.W  D0,(A0)+
+        DBF     D1,.fill
+        LEA     Packed(PC),A0
+        MOVEQ   #0,D2
+.next:  MOVE.B  (A0)+,D0
+        BMI.S   .delta
+        ASL.W   #8,D0
+        MOVE.B  (A0)+,D0
+.store: MOVE.W  D0,D2
+        BEQ.S   .done
+        MOVE.W  D0,(A1)
+.skip:  ADDQ.W  #2,A1
+        BRA.S   .next
+.delta: ANDI.W  #$007F,D0
+        BEQ.S   .skip
+        ADD.W   D2,D0
+        BRA.S   .store
+.done:  LEA     MyRead(PC),A0
+        MOVE.W  #$0002,D0
+        DC.W    $A047                   ; _SetTrapAddress
+        RTS
+Unimpl: MOVEQ   #12,D0
+        RTS
+ImplOpen:
+        MOVEQ   #0,D0
+        RTS
+ImplClose:
+        MOVEQ   #1,D0
+        RTS
+MyRead: MOVEQ   #2,D0
+        RTS
+Packed: DC.B    (ImplOpen-$400000)>>9,((ImplOpen-$400000)>>1)&$FF
+        DC.B    $82                     ; Close = Open + 2 words
+"""
+        src += "        DC.B    " + ",".join(["$80"] * 62) + "\n"
+        src += "        DC.B    0,0\n        EVEN\n        DCB.B   $400400-*,$FF\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            s_, b = os.path.join(tmp, "x.s"), os.path.join(tmp, "x.bin")
+            with open(s_, "w") as f:
+                f.write(src)
+            subprocess.run([VASM, "-quiet", "-Fbin", "-no-opt", "-m68000", "-o", b, s_], check=True,
+                           capture_output=True)
+            d, _ = build_disassembler(args_for(b, rom=True))
+            out = d.disassemble()
+        self.assertIn("packed trap table", out)
+        self.assertIn("TRAP_Open:", out)
+        self.assertIn("TRAP_Close:", out)
+        self.assertIn("TRAP_Unimplemented:", out)
+        self.assertIn("PATCH_Read:", out)
+        self.assertIn("; Trap patch at", out)
+
     def test_annotated_pipeline_reassembles(self):
         here = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:

@@ -259,6 +259,7 @@ class Disassembler68k:
         self.used_user: set[int] = set()
         self.used_traps: dict[int, str] = {}           # word -> ident
         self.bss_labels: dict[int, str] = {}
+        self.trap_patches: list[tuple] = []           # (pc, trap number, name, routine)
         self.mid_refs: dict[int, int] = {}
         self._analyzed = False
         self.lines = []
@@ -331,6 +332,7 @@ class Disassembler68k:
             lea = {}                        # An -> address loaded by LEA x(PC)/abs in this run
             prev = None
             pushed = []                     # in-image addresses pushed on the stack in this run
+            d0 = None                       # immediate last loaded into D0 in this run
             while True:
                 if pc & 1 or not self.mem.is_populated(pc) or pc in self.instrs:
                     break
@@ -367,6 +369,14 @@ class Disassembler68k:
                     self._check_macsbug(ins.end)
                 if ins.flow in TERMINAL_FLOWS:
                     break
+                if self.mac:
+                    if ins.trap and ins.trap["name"] == "SetTrapAddress" and d0 is not None and 0 in lea:
+                        self._trap_patch(ins, d0, lea[0], work)
+                    if ins.mnemonic in ("MOVE.W", "MOVEQ", "MOVE.L") and ins.ops[1] == ("D", 0) \
+                            and ins.ops[0][0] in ("imm", "simm"):
+                        d0 = ins.ops[0][1] & 0xFFFF
+                    elif ins.ops and ins.ops[-1] == ("D", 0) or ins.flow in ("call", "call_ind"):
+                        d0 = None
                 if self.atari:
                     a = self._pushed_address(ins)
                     if a is not None:
@@ -382,6 +392,24 @@ class Disassembler68k:
                                 break       # Pterm / Pterm0 / Ptermres
                 prev = ins
                 pc = ins.end
+
+    def _trap_patch(self, ins, d0, handler, work):
+        """LEA patch,A0 / MOVE.W #trap,D0 / _SetTrapAddress: name and trace
+        the routine installed into the trap table."""
+        if handler & 1 or not self.mem.is_populated(handler):
+            return
+        if (d0 & 0xF000) == 0xA000:
+            t = macsyms.trap_info(d0)
+            name = t["name"]
+        else:
+            n = d0 & 0x1FF
+            name = (macsyms.OS_TRAPS.get(n) if n < 0x50 else macsyms.TOOL_TRAPS.get(n)) or f"Trap{n:03X}"
+        self.trap_patches.append((ins.pc, d0, name, handler))
+        if handler not in self.named_entries:
+            self.named_entries[handler] = f"PATCH_{name}"
+            self.descriptions[handler] = f"patch for _{name} installed with _SetTrapAddress at ${ins.pc:06X}"
+        self.call_targets.add(handler)
+        work.append(handler)
 
     # ---------------- Atari TOS calls ----------------
 
@@ -666,6 +694,89 @@ class Disassembler68k:
                 return False
         return len(set(vals)) >= 2
 
+    def _packed_trap_table(self) -> list:
+        """64K-ROM style trap table initialization: LEA ($0400).W,A1, fill all
+        512 words with a default, then decode a packed byte stream:
+          b >= 0      absolute value: (b << 8) | next byte (0 = end)
+          b = $80     skip (entry keeps the default)
+          b = $8n     previous value + n
+        Each value is (routine - ROMBase) / 2. The stream's location comes
+        from the LEA ... ,A0 that precedes MOVE.B (A0)+,D0 in the loop."""
+        if self.rom_base is None:
+            return []
+        pcs = sorted(self.instrs)
+        for i, pc in enumerate(pcs):
+            ins = self.instrs[pc]
+            if not (ins.mnemonic == "LEA" and ins.ops[0] == ("absW", 0x400)):
+                continue
+            window = [self.instrs[p] for p in pcs[max(0, i - 4):i + 16]]
+            default = stream = None
+            for k, w in enumerate(window):
+                if w.mnemonic == "LEA" and w.ops[1] == ("A", 0) and w.ops[0][0] in ("d16PC", "absL"):
+                    nxt = window[k + 1] if k + 1 < len(window) else None
+                    a = ea_address(w.ops[0])
+                    if nxt and nxt.mnemonic == "SUBA.L":
+                        default = a
+                    elif any(x.mnemonic == "MOVE.B" and x.ops[0] == ("(A)+", 0) for x in window[k + 1:k + 4]):
+                        stream = a
+            if stream is None or not self.mem.is_populated(stream):
+                continue
+            tab, p, idx, prev = [None] * 512, stream, 0, 0
+            while idx < 512:
+                b = self.mem.byte_at(p)
+                if b is None:
+                    break
+                p += 1
+                if b & 0x80:
+                    if b == 0x80:
+                        idx += 1
+                        continue
+                    v = prev + (b & 0x7F)
+                else:
+                    lo = self.mem.byte_at(p)
+                    if lo is None:
+                        break
+                    p += 1
+                    v = (b << 8) | lo
+                prev = v
+                if v == 0:
+                    break
+                tab[idx] = v
+                idx += 1
+            if idx < 64:
+                continue
+            if self.mem.byte_at(p) == 0x00 and idx == 512:
+                p += 2 if self.mem.byte_at(p + 1) == 0x00 else 1
+            for a in range(stream, p):
+                self.data_kind[a] = "table"
+            self.labels[stream] = "PackedTrapTable"
+            work, seen = [], {}
+            if default is not None:
+                self.named_entries.setdefault(default, "TRAP_Unimplemented")
+                self.descriptions.setdefault(default, "default handler for traps not in ROM")
+                work.append(default)
+            for n, v in enumerate(tab):
+                if v is None or v & 0x8000:
+                    continue
+                t = self.rom_base + 2 * v
+                if t == default or not self.mem.is_populated(t):
+                    continue
+                name = macsyms.OS_TRAPS.get(n) if n < 0x50 else macsyms.TOOL_TRAPS.get(n)
+                name = name or f"{'OS' if n < 0x50 else 'Tool'}{n:03X}"
+                seen.setdefault(t, []).append(name)
+            for t, names in seen.items():
+                self.named_entries.setdefault(t, "TRAP_" + names[0])
+                self.descriptions.setdefault(t, "implements " + ", ".join("_" + n for n in names))
+                self.call_targets.add(t)
+                work.append(t)
+            self.dispatch_tables.append({"addr": stream, "entries": idx, "stride": 0, "hits": len(seen),
+                                         "targets": [], "trap_map": "packed 64K-ROM trap table "
+                                         "(index < $50 = OS trap, else Toolbox trap)"})
+            self.auto_found.append(f"packed trap table at ${stream:06X}-${p - 1:06X} (decoded by code at "
+                                   f"${pc:06X}): {idx} entries, {len(seen)} ROM routines named TRAP_*")
+            return work
+        return []
+
     def _detect_dispatch_tables(self) -> list:
         """ROM images: tables of 16-bit offsets from the ROM base, or 32-bit
         addresses, where most entries land on routine starts found by
@@ -889,6 +1000,7 @@ class Disassembler68k:
             if r:
                 entries.append(r[0][0] + (r[0][0] & 1))
         self._trace(list(reversed(entries)))
+        self._packed_done = not self.mac
 
         def free_set():
             return {a for a in self.mem.addresses() if self._free(a) and a not in self.reloc_bytes}
@@ -899,6 +1011,12 @@ class Disassembler68k:
             before = len(self.instrs)
             if self.fill == "validated":
                 self._fill_validated()
+                if not self._packed_done:
+                    work = self._packed_trap_table()
+                    if work:
+                        self._packed_done = True
+                        self._trace(work, core=False)
+                        self._fill_validated()
                 if self.prologues and self._prologue_scan():
                     self._fill_validated()
             self.data_kind.update(detect_data_regions(self.mem, free_set()))
@@ -1407,6 +1525,8 @@ class Disassembler68k:
             out.append(f"; Auto-detected {note}")
         for pc, vec, h in self.vector_installs:
             out.append(f"; Vector install at ${pc:06X}: ${vec:04X} <- {self.labels.get(h, hex(h))}")
+        for pc, num, name, h in self.trap_patches:
+            out.append(f"; Trap patch at ${pc:06X}: _{name} (D0=${num:04X}) <- {self.labels.get(h, hex(h))}")
         if self.sym.sources:
             out.append(f"; Symbols: {', '.join(self.sym.sources)} ({len(self.sym)} entries)")
         out.append("; =============================================")
